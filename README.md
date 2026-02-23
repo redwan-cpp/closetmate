@@ -1,4 +1,4 @@
-# ClosetMate 👗
+# ClosetMate 
 
 **ClosetMate** is an AI-powered smart wardrobe app built with React Native (Expo) and a Python FastAPI backend. It helps users manage their clothing, get AI-generated outfit suggestions, and add items to their closet by photographing them.
 
