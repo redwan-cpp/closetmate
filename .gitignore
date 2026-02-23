@@ -1,0 +1,32 @@
+# ── React Native / Expo ──────────────────────────────
+closetmate/node_modules/
+closetmate/.expo/
+closetmate/dist/
+closetmate/web-build/
+closetmate/expo-env.d.ts
+closetmate/.metro-health-check*
+closetmate/app-example/
+closetmate/ios/
+closetmate/android/
+
+# ── Python backend ────────────────────────────────────
+closetmate-ai/venv/
+closetmate-ai/__pycache__/
+closetmate-ai/*.pyc
+closetmate-ai/.env
+
+# ── General ───────────────────────────────────────────
+.DS_Store
+*.pem
+*.orig.*
+*.jks
+*.p8
+*.p12
+*.key
+*.mobileprovision
+npm-debug.*
+yarn-debug.*
+yarn-error.*
+*.tsbuildinfo
+.env
+.env*.local
