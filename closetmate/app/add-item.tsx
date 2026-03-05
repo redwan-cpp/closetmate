@@ -15,7 +15,7 @@ import {
 import * as ImagePicker from "expo-image-picker";
 import { useState, useEffect, useCallback } from "react";
 import { useLocalSearchParams, useRouter } from "expo-router";
-import { styleImage } from "@/src/api/ai";
+import { removeBackground } from "@/src/api/ai";
 import { Ionicons } from "@expo/vector-icons";
 
 const { width } = Dimensions.get("window");
@@ -38,12 +38,16 @@ export default function AddItemScreen() {
 
   const upload = useCallback(async (uri: string) => {
     setLoading(true);
+    setStyledUri(null);
     try {
-      const styled = await styleImage(uri);
-      setStyledUri(styled);
+      console.log("[add-item] Starting background removal for:", uri);
+      const result = await removeBackground(uri);
+      console.log("[add-item] Background removal succeeded, data URI length:", result.length);
+      setStyledUri(result);
     } catch (e) {
       setStyledUri(null);
       const message = e instanceof Error ? e.message : "Unknown error";
+      console.error("[add-item] Background removal failed:", message);
       Alert.alert(
         "Processing failed",
         message,
@@ -113,7 +117,7 @@ export default function AddItemScreen() {
         <Pressable style={styles.captureArea} onPress={!hasImage ? pickImage : undefined}>
           {hasImage ? (
             <Image
-              source={{ uri: displayUri }}
+              source={{ uri: displayUri ?? undefined }}
               style={styles.captureImage}
               resizeMode="contain"
             />
@@ -136,7 +140,7 @@ export default function AddItemScreen() {
         <View style={styles.previewRow}>
           <View style={styles.previewThumbWrapper}>
             <Image
-              source={{ uri: displayUri }}
+              source={{ uri: displayUri ?? undefined }}
               style={styles.previewThumb}
               resizeMode="cover"
             />

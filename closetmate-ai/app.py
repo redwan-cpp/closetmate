@@ -298,3 +298,40 @@ async def remove_background(file: UploadFile = File(...)):
         content=output_buffer.read(),
         media_type="image/png"
     )
+
+
+@app.post("/remove-bg")
+async def remove_bg(file: UploadFile = File(...)):
+    """Remove image background and return the result as base64-encoded PNG in JSON.
+
+    Returns:
+        {"image": "<base64_string>"}
+    """
+    # --- Read uploaded bytes ---
+    try:
+        input_bytes = await file.read()
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"Failed to read uploaded file: {e}") from e
+
+    if not input_bytes:
+        raise HTTPException(status_code=400, detail="Uploaded file is empty")
+
+    # --- Open image ---
+    try:
+        input_image = Image.open(io.BytesIO(input_bytes))
+    except Exception as e:
+        raise HTTPException(status_code=422, detail=f"Cannot decode image: {e}") from e
+
+    # --- Remove background ---
+    try:
+        output_image = remove(input_image)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Background removal failed: {e}") from e
+
+    # --- Encode to PNG → base64 ---
+    output_buffer = io.BytesIO()
+    output_image.save(output_buffer, format="PNG")
+    output_bytes = output_buffer.getvalue()
+    image_b64 = base64.standard_b64encode(output_bytes).decode("ascii")
+
+    return {"image": image_b64}
