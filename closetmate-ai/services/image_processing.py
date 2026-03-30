@@ -1,13 +1,19 @@
 """
 Image processing service: background removal and saving processed clothing images.
+Runs in CPU-only mode — compatible with Render and other serverless hosts.
 """
 import io
 import os
 import uuid
 from pathlib import Path
 
+# Prevent threading contention on Render / single-core hosts
+os.environ.setdefault("OMP_NUM_THREADS", "1")
+
 from PIL import Image
 from rembg import remove
+
+print("[image_processing] Using CPU-based background removal")
 
 # Directory for processed images: project_root/uploads/processed/
 _PROJECT_ROOT = Path(__file__).resolve().parent.parent

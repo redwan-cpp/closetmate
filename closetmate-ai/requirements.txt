@@ -1,15 +1,21 @@
+# ── Core API ──────────────────────────────────────────────────────────────────
 fastapi
 uvicorn
 pydantic[email]
 python-multipart
 python-dotenv
+
+# ── Image processing (CPU-only, Render-compatible) ────────────────────────────
 pillow
-rembg
-opencv-python
+opencv-python-headless
 numpy
-torch
-torchvision
+rembg[cpu]
+onnxruntime
+
+# ── AI services ───────────────────────────────────────────────────────────────
 google-generativeai
 openai
-bcrypt
+
+# ── Auth ──────────────────────────────────────────────────────────────────────
 passlib[bcrypt]
+bcrypt
