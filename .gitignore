@@ -14,6 +14,8 @@ closetmate-ai/venv/
 closetmate-ai/__pycache__/
 closetmate-ai/*.pyc
 closetmate-ai/.env
+closetmate-ai/closetmate.db
+closetmate-ai/uploads/
 
 # ── General ───────────────────────────────────────────
 .DS_Store

@@ -1,5 +1,5 @@
 import { Platform } from "react-native";
-import * as FileSystem from "expo-file-system";
+import * as FileSystem from "expo-file-system/legacy";
 
 // ---------------------------------------------------------------------------
 // Network configuration
@@ -16,7 +16,7 @@ import * as FileSystem from "expo-file-system";
  *   Windows → open PowerShell → run `ipconfig` → look for "IPv4 Address"
  *   macOS   → System Settings → Wi-Fi → Details → IP Address
  */
-const PHYSICAL_DEVICE_IP: string | null = null;
+const PHYSICAL_DEVICE_IP: string | null = "192.168.0.188";
 
 /**
  * Resolved base URL for all AI API requests.
@@ -52,6 +52,217 @@ function arrayBufferToBase64(buffer: ArrayBuffer): string {
   return btoa(binary);
 }
 
+/** Build a multipart FormData with a single "file" field from a local URI. */
+function buildImageFormData(uri: string): FormData {
+  const formData = new FormData();
+  formData.append("file", {
+    uri,
+    name: "image.jpg",
+    type: "image/jpeg",
+  } as unknown as Blob);
+  return formData;
+}
+
+// ---------------------------------------------------------------------------
+// Types
+// ---------------------------------------------------------------------------
+
+export interface SuggestedMetadata {
+  category: string;
+  subcategory: string;
+  primary_color: string;
+  material: string;
+  pattern: string;
+  formality: string;
+  culture: string;
+}
+
+export interface AnalyzeClothingResult {
+  image_path: string;
+  cached: boolean;
+  suggested: SuggestedMetadata;
+}
+
+export interface AddItemPayload {
+  user_id: string;
+  image_path: string;
+  category: string;
+  subcategory: string;
+  primary_color: string;
+  material: string;
+  pattern: string;
+  formality: string;
+  culture: string;
+}
+
+export interface AddItemResult {
+  status: string;
+  item_id: string;
+}
+
+export interface WardrobeItem {
+  item_id: string;
+  user_id: string;
+  category: string | null;
+  subcategory: string | null;
+  primary_color: string | null;
+  material: string | null;
+  pattern: string | null;
+  formality_level: string | null;
+  cultural_style: string | null;
+  image_path: string | null;
+  created_at: string;
+}
+
+// ---------------------------------------------------------------------------
+// analyzeClothing — POST /upload/analyze-clothing
+// ---------------------------------------------------------------------------
+
+/**
+ * Upload an image to the FastAPI analyze-clothing endpoint.
+ * Returns suggested metadata (category, color, material, pattern, etc.)
+ * Uses MD5 cache — same image returns instantly on subsequent calls.
+ */
+export async function analyzeClothing(uri: string): Promise<AnalyzeClothingResult> {
+  const url = `${AI_BASE_URL}/upload/analyze-clothing`;
+  console.log("[analyzeClothing] Uploading to:", url);
+
+  let response: Response;
+  try {
+    response = await fetch(url, {
+      method: "POST",
+      body: buildImageFormData(uri),
+    });
+  } catch (e) {
+    const msg = e instanceof Error ? e.message : String(e);
+    console.error("[analyzeClothing] Network error:", msg);
+    throw new Error(
+      `Cannot reach backend at ${url}.\n${msg}\n\n` +
+      "On a physical device, set PHYSICAL_DEVICE_IP in src/api/ai.ts to your PC's local IP."
+    );
+  }
+
+  console.log("[analyzeClothing] Response status:", response.status);
+
+  if (!response.ok) {
+    const text = await response.text().catch(() => "");
+    console.error("[analyzeClothing] Backend error:", text);
+    throw new Error(
+      `Analyze failed (HTTP ${response.status})` +
+      (text ? `:\n${text.slice(0, 200)}` : "")
+    );
+  }
+
+  let json: unknown;
+  try {
+    json = await response.json();
+  } catch (e) {
+    throw new Error("Analyze response is not valid JSON");
+  }
+
+  console.log("[analyzeClothing] Result:", JSON.stringify(json).slice(0, 200));
+  return json as AnalyzeClothingResult;
+}
+
+// ---------------------------------------------------------------------------
+// addWardrobeItem — POST /wardrobe/add-item
+// ---------------------------------------------------------------------------
+
+/**
+ * Save a clothing item to the user's wardrobe.
+ * Returns { status: "success", item_id }.
+ */
+export async function addWardrobeItem(payload: AddItemPayload): Promise<AddItemResult> {
+  const url = `${AI_BASE_URL}/wardrobe/add-item`;
+  console.log("[addWardrobeItem] POST", url, payload);
+
+  let response: Response;
+  try {
+    response = await fetch(url, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(payload),
+    });
+  } catch (e) {
+    const msg = e instanceof Error ? e.message : String(e);
+    throw new Error(`Cannot reach backend at ${url}.\n${msg}`);
+  }
+
+  if (!response.ok) {
+    const text = await response.text().catch(() => "");
+    throw new Error(
+      `Save failed (HTTP ${response.status})` +
+      (text ? `:\n${text.slice(0, 200)}` : "")
+    );
+  }
+
+  const json = await response.json();
+  console.log("[addWardrobeItem] Result:", json);
+  return json as AddItemResult;
+}
+
+// ---------------------------------------------------------------------------
+// getWardrobeItems — GET /wardrobe/items/{userId}
+// ---------------------------------------------------------------------------
+
+/**
+ * Fetch all wardrobe items for a given user.
+ */
+export async function getWardrobeItems(userId: string): Promise<WardrobeItem[]> {
+  const url = `${AI_BASE_URL}/wardrobe/items/${encodeURIComponent(userId)}`;
+  console.log("[getWardrobeItems] GET", url);
+
+  let response: Response;
+  try {
+    response = await fetch(url);
+  } catch (e) {
+    const msg = e instanceof Error ? e.message : String(e);
+    throw new Error(`Cannot reach backend at ${url}.\n${msg}`);
+  }
+
+  if (!response.ok) {
+    const text = await response.text().catch(() => "");
+    throw new Error(
+      `Fetch wardrobe failed (HTTP ${response.status})` +
+      (text ? `:\n${text.slice(0, 200)}` : "")
+    );
+  }
+
+  const json = await response.json();
+  console.log("[getWardrobeItems] count:", (json as unknown[]).length);
+  return json as WardrobeItem[];
+}
+
+// ---------------------------------------------------------------------------
+// deleteWardrobeItem — DELETE /wardrobe/item/{itemId}
+// ---------------------------------------------------------------------------
+
+/**
+ * Permanently delete a clothing item by ID.
+ */
+export async function deleteWardrobeItem(itemId: string): Promise<void> {
+  const url = `${AI_BASE_URL}/wardrobe/item/${encodeURIComponent(itemId)}`;
+  console.log("[deleteWardrobeItem] DELETE", url);
+
+  let response: Response;
+  try {
+    response = await fetch(url, { method: "DELETE" });
+  } catch (e) {
+    const msg = e instanceof Error ? e.message : String(e);
+    throw new Error(`Cannot reach backend at ${url}.\n${msg}`);
+  }
+
+  if (!response.ok) {
+    const text = await response.text().catch(() => "");
+    throw new Error(
+      `Delete failed (HTTP ${response.status})` +
+      (text ? `:\n${text.slice(0, 200)}` : "")
+    );
+  }
+  console.log("[deleteWardrobeItem] Deleted:", itemId);
+}
+
+
 // ---------------------------------------------------------------------------
 // removeBackground — calls POST /remove-bg, returns a data: URI
 // ---------------------------------------------------------------------------
@@ -67,21 +278,11 @@ export async function removeBackground(uri: string): Promise<string> {
   const url = `${AI_BASE_URL}/remove-bg`;
   console.log("[removeBackground] Uploading to:", url);
 
-  // Build multipart form — field name MUST match FastAPI parameter: "file"
-  const formData = new FormData();
-  formData.append("file", {
-    uri,
-    name: "image.jpg",
-    type: "image/jpeg",
-  } as unknown as Blob);
-
   let response: Response;
   try {
     response = await fetch(url, {
       method: "POST",
-      // Do NOT set Content-Type manually — the runtime must set it to
-      // multipart/form-data with the correct boundary.
-      body: formData,
+      body: buildImageFormData(uri),
     });
   } catch (e) {
     const msg = e instanceof Error ? e.message : String(e);
@@ -103,13 +304,11 @@ export async function removeBackground(uri: string): Promise<string> {
     );
   }
 
-  // Parse JSON
   let json: unknown;
   try {
     json = await response.json();
   } catch (e) {
     const msg = e instanceof Error ? e.message : String(e);
-    console.error("[removeBackground] Failed to parse JSON:", msg);
     throw new Error(`Backend response is not valid JSON: ${msg}`);
   }
 
@@ -185,8 +384,7 @@ export async function styleImage(uri: string): Promise<string> {
   const arrayBuffer = await response.arrayBuffer();
   const base64 = arrayBufferToBase64(arrayBuffer);
 
-  const dir =
-    FileSystem.documentDirectory ?? FileSystem.cacheDirectory ?? null;
+  const dir = FileSystem.documentDirectory ?? FileSystem.cacheDirectory ?? null;
 
   if (dir) {
     const fileName = `styled-${Date.now()}.jpg`;

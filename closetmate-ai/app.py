@@ -148,10 +148,6 @@ def create_editorial_background(size):
 # Clothing analysis (OpenAI Vision)
 # --------------------------------------------------
 
-CLOTHING_ANALYSIS_PROMPT = """Analyze this image of a single clothing or apparel item. Return a JSON object with exactly these three keys (no other keys, no markdown, no explanation):
-- "category": one of Shirt, Saree, Panjabi, Dress, Jeans, Top, Bottom, Footwear, Outerwear, Accessory, or another specific clothing type if none fit.
-- "primary_color": the main color (e.g. Navy, White, Red, Mustard, Green).
-- "pattern": one of solid, striped, floral, embroidered, printed, checked, polka dot, geometric, or other if needed."""
 
 
 def _analyze_clothing_image_sync(image_base64: str) -> dict:
@@ -161,6 +157,7 @@ def _analyze_clothing_image_sync(image_base64: str) -> dict:
     client = OpenAI(api_key=api_key)
     response = client.chat.completions.create(
         model="gpt-4o-mini",
+        timeout=20,
         messages=[
             {
                 "role": "user",

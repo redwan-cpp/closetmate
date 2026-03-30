@@ -6,6 +6,7 @@ import {
   ActivityIndicator,
   StyleSheet,
   SafeAreaView,
+  ScrollView,
   TouchableOpacity,
   useColorScheme,
   Dimensions,
@@ -15,12 +16,21 @@ import {
 import * as ImagePicker from "expo-image-picker";
 import { useState, useEffect, useCallback } from "react";
 import { useLocalSearchParams, useRouter } from "expo-router";
-import { removeBackground } from "@/src/api/ai";
+import { removeBackground, analyzeClothing, addWardrobeItem } from "@/src/api/ai";
 import { Ionicons } from "@expo/vector-icons";
+
+// ---------------------------------------------------------------------------
+// Constants
+// ---------------------------------------------------------------------------
 
 const { width } = Dimensions.get("window");
 const CAPTURE_SIZE = width - 48;
 const PREVIEW_SIZE = 80;
+const DEMO_USER_ID = "demo_user";
+
+// ---------------------------------------------------------------------------
+// Screen
+// ---------------------------------------------------------------------------
 
 export default function AddItemScreen() {
   const params = useLocalSearchParams<{ imageUri?: string }>();
@@ -28,44 +38,86 @@ export default function AddItemScreen() {
   const colorScheme = useColorScheme();
   const isDark = colorScheme === "dark";
 
+  // ── Image state ───────────────────────────────────────────────────────────
   const [originalUri, setOriginalUri] = useState<string | null>(null);
   const [styledUri, setStyledUri] = useState<string | null>(null);
-  const [loading, setLoading] = useState(false);
-  const [category, setCategory] = useState("Top");
-  const [color, setColor] = useState("Green");
-  const [material, setMaterial] = useState("Silk");
-  const [style, setStyle] = useState("Traditional");
+  const [imagePath, setImagePath] = useState<string>("");   // backend logical path
 
-  const upload = useCallback(async (uri: string) => {
-    setLoading(true);
+  // ── Loading states ────────────────────────────────────────────────────────
+  const [removingBg, setRemovingBg] = useState(false);
+  const [analyzing, setAnalyzing] = useState(false);
+  const [saving, setSaving] = useState(false);
+
+  // ── Form fields ───────────────────────────────────────────────────────────
+  const [category, setCategory] = useState("");
+  const [subcategory, setSubcategory] = useState("");
+  const [color, setColor] = useState("");
+  const [material, setMaterial] = useState("");
+  const [pattern, setPattern] = useState("");
+  const [style, setStyle] = useState("");
+
+  // ── Derived ───────────────────────────────────────────────────────────────
+  const loading = removingBg || analyzing;
+  const displayUri = styledUri ?? originalUri;
+  const hasImage = !!originalUri;
+  const canSave = !!styledUri && !saving;
+
+  // ── Helper: analyze + remove-bg in parallel ───────────────────────────────
+  const processImage = useCallback(async (uri: string) => {
+    setRemovingBg(true);
+    setAnalyzing(true);
     setStyledUri(null);
-    try {
-      console.log("[add-item] Starting background removal for:", uri);
-      const result = await removeBackground(uri);
-      console.log("[add-item] Background removal succeeded, data URI length:", result.length);
-      setStyledUri(result);
-    } catch (e) {
-      setStyledUri(null);
-      const message = e instanceof Error ? e.message : "Unknown error";
-      console.error("[add-item] Background removal failed:", message);
+
+    // Run both calls concurrently for speed
+    const [bgResult, analyzeResult] = await Promise.allSettled([
+      removeBackground(uri),
+      analyzeClothing(uri),
+    ]);
+
+    // Background removal
+    setRemovingBg(false);
+    if (bgResult.status === "fulfilled") {
+      setStyledUri(bgResult.value);
+    } else {
+      console.error("[add-item] Background removal failed:", bgResult.reason);
+      // Non-fatal — user still sees original image; show a soft warning
       Alert.alert(
-        "Processing failed",
-        message,
+        "Background removal failed",
+        "The original photo will be used. You can still add the item.",
         [{ text: "OK" }]
       );
-    } finally {
-      setLoading(false);
+      // Use original as fallback so save button isn't permanently disabled
+      setStyledUri(uri);
+    }
+
+    // Analyze / autofill
+    setAnalyzing(false);
+    if (analyzeResult.status === "fulfilled") {
+      const { suggested, image_path } = analyzeResult.value;
+      setImagePath(image_path ?? "");
+      // Autofill — user can edit all fields afterwards
+      if (suggested.category)      setCategory(suggested.category);
+      if (suggested.subcategory)   setSubcategory(suggested.subcategory);
+      if (suggested.primary_color) setColor(suggested.primary_color);
+      if (suggested.material)      setMaterial(suggested.material);
+      if (suggested.pattern)       setPattern(suggested.pattern);
+      if (suggested.formality)     setStyle(suggested.formality);
+    } else {
+      console.warn("[add-item] Analyze failed, manual input allowed:", analyzeResult.reason);
+      // Silent — form stays empty so user can fill manually
     }
   }, []);
 
+  // ── On param change (from FloatingCameraButton) ───────────────────────────
   useEffect(() => {
     if (params.imageUri) {
       setOriginalUri(params.imageUri);
       setStyledUri(null);
-      upload(params.imageUri);
+      processImage(params.imageUri);
     }
-  }, [params.imageUri, upload]);
+  }, [params.imageUri, processImage]);
 
+  // ── Camera picker ─────────────────────────────────────────────────────────
   const pickImage = async () => {
     const { status } = await ImagePicker.requestCameraPermissionsAsync();
     if (status !== "granted") {
@@ -84,139 +136,244 @@ export default function AddItemScreen() {
     });
 
     if (!result.canceled) {
-      setOriginalUri(result.assets[0].uri);
+      const uri = result.assets[0].uri;
+      setOriginalUri(uri);
       setStyledUri(null);
-      upload(result.assets[0].uri);
+      processImage(uri);
     }
   };
 
   const clearPreview = () => {
     setOriginalUri(null);
     setStyledUri(null);
+    setImagePath("");
+    setCategory("");
+    setSubcategory("");
+    setColor("");
+    setMaterial("");
+    setPattern("");
+    setStyle("");
   };
 
-  const displayUri = styledUri ?? originalUri;
-  const hasImage = !!originalUri;
+  // ── Save ──────────────────────────────────────────────────────────────────
+  const handleSave = async () => {
+    if (!canSave) return;
+    setSaving(true);
+    try {
+      await addWardrobeItem({
+        user_id: DEMO_USER_ID,
+        image_path: styledUri || originalUri || imagePath || "",
+        category:     category.trim()    || "unknown",
+        subcategory:  subcategory.trim() || "unknown",
+        primary_color: color.trim()      || "unknown",
+        material:     material.trim()    || "unknown",
+        pattern:      pattern.trim()     || "solid",
+        formality:    style.trim()       || "casual",
+        culture:      "global",
+      });
+      Alert.alert("Added! ✓", "Item saved to your closet.", [
+        { text: "OK", onPress: () => router.back() },
+      ]);
+    } catch (e) {
+      const msg = e instanceof Error ? e.message : String(e);
+      Alert.alert("Save failed", msg, [
+        { text: "Retry", onPress: handleSave },
+        { text: "Cancel", style: "cancel" },
+      ]);
+    } finally {
+      setSaving(false);
+    }
+  };
+
+  // ── Status text shown on the loading overlay ──────────────────────────────
+  const loadingLabel = analyzing
+    ? "Analyzing your outfit..."
+    : removingBg
+    ? "Removing background..."
+    : "";
 
   const styles = createStyles(isDark);
 
   return (
     <SafeAreaView style={styles.safeArea}>
-      {/* Top bar: flash (left), flip (right) */}
-      <View style={styles.topBar}>
-        <TouchableOpacity style={styles.topIcon} hitSlop={{ top: 12, bottom: 12, left: 12, right: 12 }}>
-          <Ionicons name="flash-outline" size={26} color={isDark ? "#FFF" : "#000"} />
-        </TouchableOpacity>
-        <TouchableOpacity style={styles.topIcon} hitSlop={{ top: 12, bottom: 12, left: 12, right: 12 }}>
-          <Ionicons name="camera-reverse-outline" size={26} color={isDark ? "#FFF" : "#000"} />
-        </TouchableOpacity>
-      </View>
+      <ScrollView
+        contentContainerStyle={styles.scrollContent}
+        keyboardShouldPersistTaps="handled"
+        showsVerticalScrollIndicator={false}
+      >
+        {/* Top bar */}
+        <View style={styles.topBar}>
+          <TouchableOpacity style={styles.topIcon} hitSlop={{ top: 12, bottom: 12, left: 12, right: 12 }}>
+            <Ionicons name="flash-outline" size={26} color={isDark ? "#FFF" : "#000"} />
+          </TouchableOpacity>
+          <TouchableOpacity style={styles.topIcon} hitSlop={{ top: 12, bottom: 12, left: 12, right: 12 }}>
+            <Ionicons name="camera-reverse-outline" size={26} color={isDark ? "#FFF" : "#000"} />
+          </TouchableOpacity>
+        </View>
 
-      {/* Capture area: dashed frame with image or tap to capture */}
-      <View style={styles.captureWrapper}>
-        <Pressable style={styles.captureArea} onPress={!hasImage ? pickImage : undefined}>
-          {hasImage ? (
-            <Image
-              source={{ uri: displayUri ?? undefined }}
-              style={styles.captureImage}
-              resizeMode="contain"
-            />
+        {/* Capture area */}
+        <View style={styles.captureWrapper}>
+          <Pressable style={styles.captureArea} onPress={!hasImage ? pickImage : undefined}>
+            {hasImage ? (
+              <Image
+                source={{ uri: displayUri ?? undefined }}
+                style={styles.captureImage}
+                resizeMode="contain"
+              />
+            ) : (
+              <View style={styles.capturePlaceholder}>
+                <Ionicons name="camera-outline" size={48} color={isDark ? "#666" : "#999"} />
+                <Text style={styles.capturePlaceholderText}>Tap to capture</Text>
+              </View>
+            )}
+            {loading && (
+              <View style={styles.loadingOverlay}>
+                <ActivityIndicator size="large" color="#FFF" />
+                {!!loadingLabel && (
+                  <Text style={styles.loadingLabel}>{loadingLabel}</Text>
+                )}
+              </View>
+            )}
+          </Pressable>
+        </View>
+
+        {/* Preview thumbnail */}
+        {hasImage && (
+          <View style={styles.previewRow}>
+            <View style={styles.previewThumbWrapper}>
+              <Image
+                source={{ uri: displayUri ?? undefined }}
+                style={styles.previewThumb}
+                resizeMode="cover"
+              />
+              <TouchableOpacity
+                style={styles.previewRemove}
+                onPress={clearPreview}
+                hitSlop={{ top: 8, bottom: 8, left: 8, right: 8 }}
+              >
+                <Ionicons name="close" size={20} color={isDark ? "#FFF" : "#000"} />
+              </TouchableOpacity>
+            </View>
+          </View>
+        )}
+
+        {/* Form card */}
+        <View style={styles.formCard}>
+          <FormRow
+            label="Category:"
+            value={category}
+            onChange={setCategory}
+            placeholder="e.g. top"
+            isDark={isDark}
+            styles={styles}
+          />
+          <FormRow
+            label="Sub-type:"
+            value={subcategory}
+            onChange={setSubcategory}
+            placeholder="e.g. panjabi"
+            isDark={isDark}
+            styles={styles}
+          />
+          <FormRow
+            label="Color:"
+            value={color}
+            onChange={setColor}
+            placeholder="e.g. navy blue"
+            isDark={isDark}
+            styles={styles}
+          />
+          <FormRow
+            label="Material:"
+            value={material}
+            onChange={setMaterial}
+            placeholder="e.g. cotton"
+            isDark={isDark}
+            styles={styles}
+          />
+          <FormRow
+            label="Pattern:"
+            value={pattern}
+            onChange={setPattern}
+            placeholder="e.g. solid"
+            isDark={isDark}
+            styles={styles}
+          />
+          <FormRow
+            label="Style:"
+            value={style}
+            onChange={setStyle}
+            placeholder="e.g. casual"
+            isDark={isDark}
+            styles={styles}
+            last
+          />
+        </View>
+
+        {/* Confirm button */}
+        <Pressable
+          style={[
+            styles.confirmButton,
+            (!canSave || loading) && styles.confirmButtonDisabled,
+          ]}
+          onPress={canSave && !loading ? handleSave : undefined}
+          disabled={!canSave || loading}
+        >
+          {saving ? (
+            <ActivityIndicator color="#FFF" />
           ) : (
-            <View style={styles.capturePlaceholder}>
-              <Ionicons name="camera-outline" size={48} color={isDark ? "#666" : "#999"} />
-              <Text style={styles.capturePlaceholderText}>Tap to capture</Text>
-            </View>
-          )}
-          {loading && (
-            <View style={styles.loadingOverlay}>
-              <ActivityIndicator size="large" color="#FFF" />
-            </View>
+            <Text style={styles.confirmButtonText}>Confirm &amp; Add to Closet</Text>
           )}
         </Pressable>
-      </View>
-
-      {/* Preview thumbnail + X */}
-      {hasImage && (
-        <View style={styles.previewRow}>
-          <View style={styles.previewThumbWrapper}>
-            <Image
-              source={{ uri: displayUri ?? undefined }}
-              style={styles.previewThumb}
-              resizeMode="cover"
-            />
-            <TouchableOpacity
-              style={styles.previewRemove}
-              onPress={clearPreview}
-              hitSlop={{ top: 8, bottom: 8, left: 8, right: 8 }}
-            >
-              <Ionicons name="close" size={20} color={isDark ? "#FFF" : "#000"} />
-            </TouchableOpacity>
-          </View>
-        </View>
-      )}
-
-      {/* Form card: Category, Color, Material, Style */}
-      <View style={styles.formCard}>
-        <View style={styles.formRow}>
-          <Text style={styles.formLabel}>Category:</Text>
-          <TextInput
-            style={styles.formInput}
-            value={category}
-            onChangeText={setCategory}
-            placeholder="e.g. Top"
-            placeholderTextColor={isDark ? "#636366" : "#8E8E93"}
-          />
-        </View>
-        <View style={styles.formRow}>
-          <Text style={styles.formLabel}>Color:</Text>
-          <TextInput
-            style={styles.formInput}
-            value={color}
-            onChangeText={setColor}
-            placeholder="e.g. Green"
-            placeholderTextColor={isDark ? "#636366" : "#8E8E93"}
-          />
-        </View>
-        <View style={styles.formRow}>
-          <Text style={styles.formLabel}>Material:</Text>
-          <TextInput
-            style={styles.formInput}
-            value={material}
-            onChangeText={setMaterial}
-            placeholder="e.g. Silk"
-            placeholderTextColor={isDark ? "#636366" : "#8E8E93"}
-          />
-        </View>
-        <View style={styles.formRow}>
-          <Text style={styles.formLabel}>Style:</Text>
-          <TextInput
-            style={styles.formInput}
-            value={style}
-            onChangeText={setStyle}
-            placeholder="e.g. Traditional"
-            placeholderTextColor={isDark ? "#636366" : "#8E8E93"}
-          />
-        </View>
-      </View>
-
-      {/* Confirm button */}
-      <Pressable
-        style={[styles.confirmButton, !styledUri && styles.confirmButtonDisabled]}
-        onPress={styledUri ? () => router.back() : undefined}
-        disabled={!styledUri}
-      >
-        <Text style={styles.confirmButtonText}>Confirm & Add to Closet</Text>
-      </Pressable>
+      </ScrollView>
     </SafeAreaView>
   );
 }
+
+// ---------------------------------------------------------------------------
+// FormRow helper
+// ---------------------------------------------------------------------------
+
+interface FormRowProps {
+  label: string;
+  value: string;
+  onChange: (v: string) => void;
+  placeholder: string;
+  isDark: boolean;
+  styles: ReturnType<typeof createStyles>;
+  last?: boolean;
+}
+
+function FormRow({ label, value, onChange, placeholder, isDark, styles, last }: FormRowProps) {
+  return (
+    <View style={[styles.formRow, last && { marginBottom: 0 }]}>
+      <Text style={styles.formLabel}>{label}</Text>
+      <TextInput
+        style={styles.formInput}
+        value={value}
+        onChangeText={onChange}
+        placeholder={placeholder}
+        placeholderTextColor={isDark ? "#636366" : "#8E8E93"}
+        autoCapitalize="none"
+        autoCorrect={false}
+      />
+    </View>
+  );
+}
+
+// ---------------------------------------------------------------------------
+// Styles
+// ---------------------------------------------------------------------------
 
 function createStyles(isDark: boolean) {
   return StyleSheet.create({
     safeArea: {
       flex: 1,
       backgroundColor: isDark ? "#000" : "#FFF",
+    },
+    scrollContent: {
       paddingHorizontal: 24,
+      paddingBottom: 40,
     },
     topBar: {
       flexDirection: "row",
@@ -257,9 +414,16 @@ function createStyles(isDark: boolean) {
     },
     loadingOverlay: {
       ...StyleSheet.absoluteFillObject,
-      backgroundColor: "rgba(0,0,0,0.5)",
+      backgroundColor: "rgba(0,0,0,0.6)",
       justifyContent: "center",
       alignItems: "center",
+      gap: 12,
+    },
+    loadingLabel: {
+      color: "#FFF",
+      fontSize: 14,
+      fontWeight: "500",
+      textAlign: "center",
     },
     previewRow: {
       flexDirection: "row",
@@ -303,7 +467,7 @@ function createStyles(isDark: boolean) {
     formLabel: {
       fontSize: 14,
       color: isDark ? "#AEAEB2" : "#3C3C43",
-      width: 90,
+      width: 80,
     },
     formInput: {
       flex: 1,
@@ -322,7 +486,7 @@ function createStyles(isDark: boolean) {
       justifyContent: "center",
     },
     confirmButtonDisabled: {
-      opacity: 0.6,
+      opacity: 0.5,
     },
     confirmButtonText: {
       fontSize: 16,

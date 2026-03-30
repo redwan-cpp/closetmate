@@ -1,0 +1,14 @@
+fastapi
+uvicorn
+pydantic[email]
+python-multipart
+pillow
+rembg
+google-generativeai
+python-dotenv
+bcrypt
+opencv-python
+numpy
+torch
+torchvision
+openai
