@@ -2,13 +2,14 @@ fastapi
 uvicorn
 pydantic[email]
 python-multipart
+python-dotenv
 pillow
 rembg
-google-generativeai
-python-dotenv
-bcrypt
 opencv-python
 numpy
 torch
 torchvision
+google-generativeai
 openai
+bcrypt
+passlib[bcrypt]

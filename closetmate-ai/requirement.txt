@@ -1,7 +1,0 @@
-fastapi
-uvicorn
-python-multipart
-pillow
-rembg
-openai
-passlib[bcrypt]
