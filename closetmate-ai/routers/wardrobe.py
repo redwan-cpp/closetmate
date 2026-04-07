@@ -33,14 +33,15 @@ def add_item(
     db.execute(
         """
         INSERT INTO wardrobe_items (
-            item_id, user_id, category, primary_color, material,
+            item_id, user_id, category, subcategory, primary_color, material,
             pattern, formality_level, cultural_style, image_path, created_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
         (
             item_id,
             payload.user_id,
             payload.category,
+            payload.subcategory,
             payload.primary_color,
             payload.material,
             payload.pattern,
@@ -77,7 +78,7 @@ def list_items(
             item_id=row["item_id"],
             user_id=row["user_id"],
             category=row["category"],
-            subcategory=None,          # not in schema yet — forward-compatible
+            subcategory=row["subcategory"] if "subcategory" in row.keys() else None,
             primary_color=row["primary_color"],
             material=row["material"],
             pattern=row["pattern"],

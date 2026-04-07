@@ -148,6 +148,15 @@ def create_editorial_background(size):
 # Clothing analysis (OpenAI Vision)
 # --------------------------------------------------
 
+CLOTHING_ANALYSIS_PROMPT = """\
+You are an expert fashion analyst. Examine this clothing image and return ONLY a JSON object with these keys:
+  "category"      — top-level type: Tops, Bottoms, Dresses, Outerwear, Footwear, Accessories, Traditional
+  "primary_color" — dominant color (e.g. "navy blue", "olive green", "cherry red")
+  "pattern"       — surface pattern: solid, striped, floral, checked, printed, embroidered, graphic, geometric, etc.
+
+Return ONLY the JSON object. No markdown, no explanation.\
+"""
+
 
 
 def _analyze_clothing_image_sync(image_base64: str) -> dict:

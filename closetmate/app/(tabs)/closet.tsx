@@ -2,7 +2,6 @@ import React, { useState, useCallback, useRef, memo } from 'react';
 import {
   StyleSheet,
   View,
-  SafeAreaView,
   FlatList,
   TouchableOpacity,
   ActivityIndicator,
@@ -13,6 +12,7 @@ import {
   Alert,
   Vibration,
 } from 'react-native';
+import { SafeAreaView } from 'react-native-safe-area-context';
 import { useFocusEffect, useRouter } from 'expo-router';
 import { Ionicons } from '@expo/vector-icons';
 import { useColorScheme } from '@/hooks/use-color-scheme';
@@ -255,7 +255,14 @@ export default function ClosetScreen() {
   ];
 
   // ── Category sections ─────────────────────────────────────────────────────
-  const categorySections = CATEGORIES.map((cat) => {
+  type CategorySection = {
+    key: string;
+    label: string;
+    icon: React.ComponentProps<typeof Ionicons>['name'];
+    count: number;
+    previewUri: string | null;
+  };
+  const categorySections: CategorySection[] = CATEGORIES.map((cat) => {
     const matched = items.filter((i) => (i.category ?? '').toLowerCase() === cat.key);
     return { ...cat, count: matched.length, previewUri: matched[0]?.image_path ?? null };
   }).filter((c) => c.count > 0);
@@ -264,7 +271,7 @@ export default function ClosetScreen() {
   const otherItems = items.filter((i) => !knownKeys.has((i.category ?? '').toLowerCase()));
   if (otherItems.length > 0) {
     categorySections.push({
-      key: 'other', label: 'Other', icon: 'grid-outline' as const,
+      key: 'other', label: 'Other', icon: 'grid-outline',
       count: otherItems.length, previewUri: otherItems[0]?.image_path ?? null,
     });
   }

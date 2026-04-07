@@ -5,7 +5,6 @@ import {
   Pressable,
   ActivityIndicator,
   StyleSheet,
-  SafeAreaView,
   ScrollView,
   TouchableOpacity,
   useColorScheme,
@@ -13,6 +12,7 @@ import {
   TextInput,
   Alert,
 } from "react-native";
+import { SafeAreaView } from "react-native-safe-area-context";
 import * as ImagePicker from "expo-image-picker";
 import { useState, useEffect, useCallback } from "react";
 import { useLocalSearchParams, useRouter } from "expo-router";

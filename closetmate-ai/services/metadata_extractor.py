@@ -1,9 +1,16 @@
 """
-Clothing metadata extraction service.
+Clothing metadata extraction service — multicultural, high-accuracy.
 
-Pipeline:
-  PRIMARY  → OpenAI Vision (GPT-4o-mini) — full 7-field metadata in one call
-  FALLBACK → Hybrid classifier (CV rules + MobileNetV3) + Gemini details + CV KMeans color
+Pipeline
+--------
+PRIMARY   → OpenAI Vision (GPT-4o-mini)
+              Analyses full garment → 7 fields in one API call.
+              Result is cached in-process by MD5 hash so the same image bytes
+              never trigger a second API call.
+
+FALLBACK  → Hybrid CV classifier (MobileNetV3 + rule engine)
+              + Gemini REST → pattern / color / formality
+              + KMeans CV color  (if both AI paths are unavailable)
 """
 from __future__ import annotations
 
@@ -15,6 +22,7 @@ import json
 import logging
 import os
 import pathlib
+from functools import lru_cache
 from typing import Optional
 
 import numpy as np
@@ -27,15 +35,38 @@ from services.clothing_classifier import classifier as _hybrid_classifier
 log = logging.getLogger(__name__)
 
 
+# ---------------------------------------------------------------------------
+# In-process cache — keyed by MD5 of raw image bytes
+# Prevents calling OpenAI more than once per unique image within a process.
+# ---------------------------------------------------------------------------
+
+_openai_cache: dict[str, dict] = {}   # md5_hex → result dict
+_MAX_CACHE_SIZE = 256                  # evict oldest when full
+
+
+def _get_image_hash(image_bytes: bytes) -> str:
+    return hashlib.md5(image_bytes, usedforsecurity=False).hexdigest()
+
+
+# Public alias used by routers
 def get_image_hash(image_bytes: bytes) -> str:
-    """Return the MD5 hex digest of raw image bytes — used as cache key."""
-    return hashlib.md5(image_bytes).hexdigest()
+    return _get_image_hash(image_bytes)
 
 
+def _cache_get(key: str) -> Optional[dict]:
+    return _openai_cache.get(key)
+
+
+def _cache_set(key: str, value: dict) -> None:
+    if len(_openai_cache) >= _MAX_CACHE_SIZE:
+        # Evict the oldest inserted entry (dict preserves insertion order in Py3.7+)
+        oldest = next(iter(_openai_cache))
+        del _openai_cache[oldest]
+    _openai_cache[key] = value
 
 
 # ---------------------------------------------------------------------------
-# Robust .env loading — works regardless of how/where uvicorn is launched
+# Env loader — 3-layer fallback
 # ---------------------------------------------------------------------------
 
 def _load_env_key(key: str) -> Optional[str]:
@@ -51,7 +82,6 @@ def _load_env_key(key: str) -> Optional[str]:
             return val
     except Exception:
         pass
-    # Direct .env parse — no dependency needed
     env_path = pathlib.Path(__file__).parent.parent / ".env"
     if env_path.exists():
         try:
@@ -70,7 +100,7 @@ def _load_env_key(key: str) -> Optional[str]:
 
 
 # ---------------------------------------------------------------------------
-# Gemini REST endpoints — tried in order, first success wins
+# Gemini REST — fallback visual-detail extractor (pattern / color / formality)
 # ---------------------------------------------------------------------------
 
 _GEMINI_ENDPOINTS = [
@@ -82,47 +112,28 @@ _GEMINI_ENDPOINTS = [
      "https://generativelanguage.googleapis.com/v1/models/gemini-1.5-flash:generateContent"),
     ("gemini-1.5-flash-8b",
      "https://generativelanguage.googleapis.com/v1/models/gemini-1.5-flash-8b:generateContent"),
-    ("gemini-1.5-flash-latest",
-     "https://generativelanguage.googleapis.com/v1/models/gemini-1.5-flash-latest:generateContent"),
 ]
 
-# Gemini is asked ONLY about visual details — not category (that's the hybrid classifier's job)
 _GEMINI_DETAILS_PROMPT = """\
 You are an expert fashion analyst. Look at this clothing image and return a single JSON object with EXACTLY these three keys:
 
-"pattern" — the surface pattern. Be specific:
-  solid, striped, pinstripe, vertical stripes, horizontal stripes,
-  plaid, checked, houndstooth, tartan,
-  floral, botanical, tropical,
-  paisley, ikat, batik, tie-dye,
-  geometric, abstract, color block,
-  polka dot, heart print, star print,
-  animal print, leopard print, zebra print, camouflage,
-  graphic print, text print, logo print,
-  embroidered, sequined, lace, quilted, ombre,
-  other (describe briefly if truly unique)
+"pattern" — surface pattern: solid, striped, floral, checked, plaid, polka dot, printed, embroidered, graphic, abstract, color block, animal print, camouflage, tie-dye, paisley, houndstooth, geometric, lace, sequined
 
 "primary_color" — dominant garment color, be specific:
-  e.g. "navy blue", "olive green", "burnt orange", "cherry red", "dusty pink",
-  "cream", "charcoal gray", "burgundy", "cobalt blue", "coral pink"
+  e.g. "navy blue", "olive green", "burnt orange", "cherry red", "dusty pink", "cream", "charcoal gray"
 
-"formality_level" — ONE of: casual, smart casual, formal, semi-formal, traditional, sportswear
+"formality_level" — ONE of: casual, smart casual, formal, semi-formal, festive, sportswear
 
 Return ONLY the JSON object. No markdown, no explanation."""
 
 
 def _gemini_get_details_sync(image_bytes: bytes) -> Optional[dict]:
-    """
-    Call Gemini to get pattern, primary_color, formality_level only.
-    Category is NOT asked — handled by hybrid classifier.
-    Returns dict or None on failure.
-    """
     api_key = _load_env_key("GEMINI_API_KEY")
     if not api_key:
         log.warning("GEMINI_API_KEY not set — skipping Gemini refinement")
         return None
 
-    log.info("Calling Gemini for pattern/color/formality (key len=%d)...", len(api_key))
+    log.info("Calling Gemini for pattern/color/formality...")
 
     try:
         img = Image.open(io.BytesIO(image_bytes)).convert("RGB")
@@ -134,12 +145,10 @@ def _gemini_get_details_sync(image_bytes: bytes) -> Optional[dict]:
         return None
 
     payload = {
-        "contents": [{
-            "parts": [
-                {"text": _GEMINI_DETAILS_PROMPT},
-                {"inline_data": {"mime_type": "image/jpeg", "data": b64_image}},
-            ]
-        }],
+        "contents": [{"parts": [
+            {"text": _GEMINI_DETAILS_PROMPT},
+            {"inline_data": {"mime_type": "image/jpeg", "data": b64_image}},
+        ]}],
         "generationConfig": {
             "responseMimeType": "application/json",
             "temperature": 0.1,
@@ -151,29 +160,28 @@ def _gemini_get_details_sync(image_bytes: bytes) -> Optional[dict]:
         try:
             resp = _requests.post(url, params={"key": api_key}, json=payload, timeout=30)
             if resp.status_code == 429:
-                log.warning("Quota exceeded for %s — trying next...", model_id)
+                log.warning("Gemini quota exceeded for %s — trying next...", model_id)
                 continue
             if resp.status_code != 200:
-                log.error("Gemini %s error %d: %s", model_id, resp.status_code, resp.text[:300])
+                log.error("Gemini %s HTTP %d: %.300s", model_id, resp.status_code, resp.text)
                 continue
 
             data = resp.json()
             text = data["candidates"][0]["content"]["parts"][0]["text"].strip()
-
             if text.startswith("```"):
                 lines = text.split("\n")
                 text = "\n".join(ln for ln in lines if not ln.strip().startswith("```")).strip()
 
             result = json.loads(text)
 
-            def _clean(v: object) -> Optional[str]:
+            def _c(v: object) -> Optional[str]:
                 s = str(v).strip() if v else ""
-                return s if s else None
+                return s.lower() if s else None
 
             out = {
-                "pattern":         _clean(result.get("pattern")),
-                "primary_color":   _clean(result.get("primary_color")),
-                "formality_level": _clean(result.get("formality_level")),
+                "pattern":         _c(result.get("pattern")),
+                "primary_color":   _c(result.get("primary_color")),
+                "formality_level": _c(result.get("formality_level")),
             }
             log.info("✅ Gemini (%s) details: %s", model_id, out)
             return out
@@ -190,7 +198,7 @@ def _gemini_get_details_sync(image_bytes: bytes) -> Optional[dict]:
 
 
 # ---------------------------------------------------------------------------
-# CV color fallback (runs in parallel with Gemini for speed)
+# CV color fallback — KMeans on foreground pixels
 # ---------------------------------------------------------------------------
 
 _COLOR_PALETTE = [
@@ -250,17 +258,14 @@ def _rgb_to_hsl(rgb: np.ndarray) -> np.ndarray:
 
 
 def _dominant_color_from_rgba(rembg_img: Image.Image, orig_img: Image.Image) -> str:
-    alpha = np.array(rembg_img.convert("RGBA"), dtype=np.float32)[:, :, 3].reshape(-1)
-    rgb_flat = np.array(orig_img.convert("RGB"), dtype=np.float32).reshape(-1, 3)
+    alpha    = np.array(rembg_img.convert("RGBA"), dtype=np.float32)[:, :, 3].reshape(-1)
+    rgb_flat = np.array(orig_img.convert("RGB"),   dtype=np.float32).reshape(-1, 3)
     mask = alpha >= 200
     rgb = rgb_flat[mask]
-    if len(rgb) < 10:
-        rgb = rgb_flat[alpha >= 100]
-    if len(rgb) < 10:
-        return "unknown"
+    if len(rgb) < 10: rgb = rgb_flat[alpha >= 100]
+    if len(rgb) < 10: return "unknown"
     rgb = rgb[rgb.sum(axis=1) >= 60]
-    if len(rgb) < 10:
-        return "unknown"
+    if len(rgb) < 10: return "unknown"
     hsl = _rgb_to_hsl(rgb)
     keep = (hsl[:, 1] > 0.08) | (hsl[:, 2] < 0.25)
     rgb = rgb[keep] if keep.sum() >= 50 else rgb
@@ -288,30 +293,46 @@ def _dominant_color_from_rgba(rembg_img: Image.Image, orig_img: Image.Image) -> 
 
 
 # ---------------------------------------------------------------------------
-# OpenAI Vision — primary path (full metadata in a single call)
+# OpenAI primary path — with in-process deduplication cache
 # ---------------------------------------------------------------------------
 
 def _openai_full_metadata_sync(image_bytes: bytes) -> Optional[dict]:
     """
-    Convert image bytes to base64, call analyze_clothing_with_openai(), and
-    return the result dict or None if any step fails.
-    Called once per image — result is not re-requested anywhere else.
+    Call OpenAI Vision for the given image bytes.
+    Results are cached by MD5 hash — the API is called AT MOST ONCE per image
+    within the lifetime of the server process.
     """
-    try:
-        from services.openai_vision import analyze_clothing_with_openai, image_bytes_to_base64
-    except ImportError as exc:
-        log.error("Could not import openai_vision: %s", exc)
-        return None
+    from services.openai_vision import analyze_clothing_with_openai, image_bytes_to_base64
 
+    img_hash = _get_image_hash(image_bytes)
+
+    # ── Cache hit ───────────────────────────────────────────────────────────
+    cached = _cache_get(img_hash)
+    if cached is not None:
+        log.info("Cache hit for image %s — skipping OpenAI call", img_hash[:8])
+        return cached
+
+    # ── Cache miss: call OpenAI ─────────────────────────────────────────────
     try:
-        b64 = image_bytes_to_base64(image_bytes, max_size=768)
+        b64 = image_bytes_to_base64(image_bytes, max_size=1024)
     except Exception as exc:
-        log.error("Failed to convert image to base64 for OpenAI: %s", exc)
+        log.error("Failed to encode image for OpenAI: %s", exc)
         return None
 
+    log.info("Using OpenAI Vision (cache miss, hash=%s)", img_hash[:8])
     print("Using OpenAI Vision")
-    log.info("Using OpenAI Vision")
-    return analyze_clothing_with_openai(b64)
+
+    result = analyze_clothing_with_openai(b64)
+
+    if result:
+        _cache_set(img_hash, result)
+        log.info(
+            "Detected clothing: %s, culture: %s",
+            result.get("subcategory", "unknown"),
+            result.get("culture", "unknown"),
+        )
+
+    return result
 
 
 # ---------------------------------------------------------------------------
@@ -320,42 +341,48 @@ def _openai_full_metadata_sync(image_bytes: bytes) -> Optional[dict]:
 
 async def extract_clothing_metadata(image_bytes: bytes) -> dict:
     """
-    Full pipeline:
+    Full extraction pipeline (async-friendly).
 
-    PRIMARY PATH (OpenAI Vision):
-      1. Convert image → base64
-      2. Call GPT-4o-mini → 7-field JSON (category, subcategory, primary_color,
-         pattern, material, formality, culture)
-      3. Return structured result
+    PRIMARY  → OpenAI Vision (GPT-4o-mini)
+                 Returns all 7 fields: category, subcategory, culture,
+                 primary_color, material, pattern, formality.
+                 Result cached per image hash — OpenAI called only once.
 
-    FALLBACK PATH (if OpenAI unavailable/fails):
-      1. Hybrid classifier (CV + MobileNet) — determines category (offline)
-      2. rembg + CV KMeans — dominant color fallback
-      3. Gemini — refines pattern / primary_color / formality (optional, online)
+    FALLBACK → Hybrid CV (MobileNetV3) + Gemini + KMeans color
+                 Used when OpenAI is unavailable or returns incomplete data.
+                 Weak/missing AI fields are filled with "unknown".
     """
-    # ── Primary: OpenAI Vision ────────────────────────────────────────────
-    openai_task = asyncio.to_thread(_openai_full_metadata_sync, image_bytes)
-    openai_result = await openai_task
+    # ── PRIMARY: OpenAI Vision ───────────────────────────────────────────────
+    openai_result = await asyncio.to_thread(_openai_full_metadata_sync, image_bytes)
 
     if openai_result:
-        log.info("✅ OpenAI Vision metadata: %s", openai_result)
-        # Normalise formality key — endpoint contract uses "formality_level"
-        formality = openai_result.get("formality") or openai_result.get("formality_level") or "casual"
-        return {
-            "category":        openai_result.get("category")      or "unknown",
-            "subcategory":     openai_result.get("subcategory")    or "unknown",
-            "primary_color":   openai_result.get("primary_color")  or "unknown",
-            "pattern":         openai_result.get("pattern")        or "solid",
-            "material":        openai_result.get("material")       or "unknown",
-            "formality_level": formality,
-            "culture":         openai_result.get("culture")        or "global",
-            "confidence":      1.0,
-            "method":          "openai_vision",
-        }
+        # Validate: all 7 fields must have a meaningful value
+        weak_fields = [
+            k for k in ("category", "subcategory", "primary_color")
+            if not openai_result.get(k) or openai_result.get(k) == "unknown"
+        ]
+        if not weak_fields:
+            log.info("✅ OpenAI Vision — full result returned")
+            formality = openai_result.get("formality") or openai_result.get("formality_level") or "casual"
+            return {
+                "category":        openai_result.get("category")      or "unknown",
+                "subcategory":     openai_result.get("subcategory")    or "unknown",
+                "culture":         openai_result.get("culture")        or "global",
+                "primary_color":   openai_result.get("primary_color")  or "unknown",
+                "material":        openai_result.get("material")       or "unknown",
+                "pattern":         openai_result.get("pattern")        or "solid",
+                "formality_level": formality,
+                "confidence":      1.0,
+                "method":          "openai_vision",
+            }
+        else:
+            log.warning(
+                "OpenAI result has weak fields %s — falling back to CV for those", weak_fields
+            )
 
-    # ── Fallback: Hybrid CV + Gemini ────────────────────────────────────
+    # ── FALLBACK: Hybrid CV + Gemini ─────────────────────────────────────────
+    log.warning("Falling back to local CV")
     print("Falling back to local CV")
-    log.warning("OpenAI Vision failed or unavailable — falling back to local CV")
 
     original_img: Optional[Image.Image] = None
     try:
@@ -363,49 +390,62 @@ async def extract_clothing_metadata(image_bytes: bytes) -> dict:
     except Exception:
         pass
 
+    # Run hybrid classifier and Gemini in parallel
     hybrid_task = asyncio.to_thread(_hybrid_classifier.classify, image_bytes)
     gemini_task = asyncio.to_thread(_gemini_get_details_sync, image_bytes)
 
-    # CV color via rembg (CPU-bound — run before awaiting async tasks)
+    # CV color (CPU-bound; run before awaiting)
     cv_color = "unknown"
     if original_img is not None:
         try:
-            fg_img = remove(original_img)
+            fg_img   = remove(original_img)
             cv_color = _dominant_color_from_rgba(fg_img, original_img)
         except Exception as exc:
             log.warning("rembg/color failed: %s", exc)
 
-    hybrid_result = await hybrid_task
+    hybrid_result  = await hybrid_task
     gemini_details = await gemini_task
 
-    category   = hybrid_result.get("category", "Unknown")
+    category   = hybrid_result.get("category", "unknown")
     confidence = hybrid_result.get("confidence", 0.0)
     method     = hybrid_result.get("method", "unknown")
 
+    # If we had a partial OpenAI result, prefer its values for fields it did provide
+    partial = openai_result or {}
+
     if gemini_details:
-        pattern         = gemini_details.get("pattern")         or "solid"
-        primary_color   = gemini_details.get("primary_color")   or cv_color
-        formality_level = gemini_details.get("formality_level") or "casual"
+        pattern         = partial.get("pattern")       or gemini_details.get("pattern")         or "solid"
+        primary_color   = partial.get("primary_color") or gemini_details.get("primary_color")   or cv_color
+        formality_level = partial.get("formality")     or gemini_details.get("formality_level") or "casual"
         method          = method + "+gemini"
     else:
         log.warning("Gemini unavailable — using CV color and defaults for pattern/formality")
-        pattern         = "solid"
-        primary_color   = cv_color
-        formality_level = "casual"
+        pattern         = partial.get("pattern")       or "solid"
+        primary_color   = partial.get("primary_color") or cv_color
+        formality_level = partial.get("formality")     or "casual"
+
+    # Fill remaining fields from partial OpenAI result if available
+    subcategory = partial.get("subcategory") or "unknown"
+    culture     = partial.get("culture")     or "global"
+    material    = partial.get("material")    or "unknown"
 
     log.info(
-        "✅ Fallback metadata: category=%s conf=%.2f method=%s | pattern=%s color=%s formality=%s",
-        category, confidence, method, pattern, primary_color, formality_level,
+        "Detected clothing: %s, culture: %s | method=%s conf=%.2f",
+        subcategory, culture, method, confidence,
+    )
+    log.info(
+        "✅ Fallback metadata: category=%s | pattern=%s color=%s formality=%s",
+        category, pattern, primary_color, formality_level,
     )
 
     return {
         "category":        category,
-        "subcategory":     "unknown",
+        "subcategory":     subcategory,
+        "culture":         culture,
         "confidence":      round(confidence, 2),
         "method":          method,
         "primary_color":   primary_color,
         "pattern":         pattern,
-        "material":        "unknown",
+        "material":        material,
         "formality_level": formality_level,
-        "culture":         "global",
     }

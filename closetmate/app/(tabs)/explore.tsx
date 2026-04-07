@@ -1,5 +1,6 @@
 import React from 'react';
-import { StyleSheet, FlatList, View, SafeAreaView } from 'react-native';
+import { StyleSheet, FlatList, View } from 'react-native';
+import { SafeAreaView } from 'react-native-safe-area-context';
 import { ThemedText } from '@/components/themed-text';
 import { ThemedView } from '@/components/themed-view';
 import { ExploreCard } from '@/components/explore-card';

@@ -6,6 +6,7 @@ except ImportError:
 
 import os
 from fastapi import FastAPI
+from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 from routers import auth, upload, wardrobe, recommend, skin_tone, images
 from database import init_db
@@ -14,6 +15,19 @@ app = FastAPI(
   title="ClosetMate AI Backend",
   description="AI-powered wardrobe management and outfit recommendation API",
   version="0.1.0",
+)
+
+# ---------------------------------------------------------------------------
+# CORS — allow any origin so physical devices, emulators, and web clients
+# can all reach the API without preflight failures.
+# In production, replace "*" with your specific allowed origins.
+# ---------------------------------------------------------------------------
+app.add_middleware(
+  CORSMiddleware,
+  allow_origins=["*"],
+  allow_credentials=False,
+  allow_methods=["*"],
+  allow_headers=["*"],
 )
 
 # Ensure database schema is created on startup/import.
@@ -40,3 +54,9 @@ app.mount("/uploads", StaticFiles(directory=_uploads_dir), name="uploads")
 @app.get("/")
 def root():
   return {"message": "ClosetMate Backend Running"}
+
+
+@app.get("/health")
+def health():
+  """Simple health-check endpoint for uptime monitors and CI checks."""
+  return {"status": "ok", "version": "0.1.0"}

@@ -35,6 +35,7 @@ def init_db() -> None:
         item_id TEXT PRIMARY KEY,
         user_id TEXT NOT NULL,
         category TEXT,
+        subcategory TEXT,
         primary_color TEXT,
         material TEXT,
         pattern TEXT,
@@ -45,6 +46,11 @@ def init_db() -> None:
       )
       """
     )
+    # Safe migration — add subcategory if it doesn't exist yet (older DBs)
+    try:
+      conn.execute("ALTER TABLE wardrobe_items ADD COLUMN subcategory TEXT")
+    except Exception:
+      pass  # column already exists — that's fine
     conn.execute(
       """
       CREATE TABLE IF NOT EXISTS clothing_metadata_cache (

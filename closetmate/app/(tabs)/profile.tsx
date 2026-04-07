@@ -2,13 +2,13 @@ import React, { useState } from 'react';
 import {
   StyleSheet,
   View,
-  SafeAreaView,
   ScrollView,
   Image,
   TouchableOpacity,
   useColorScheme,
   Dimensions,
 } from 'react-native';
+import { SafeAreaView } from 'react-native-safe-area-context';
 import { ThemedText } from '@/components/themed-text';
 import { MOCK_PROFILE_EXTENDED, SKIN_TONE_COLORS } from '@/constants/MockData';
 import { Spacing } from '@/constants/theme';
