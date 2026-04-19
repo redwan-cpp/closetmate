@@ -8,7 +8,7 @@ import os
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
-from routers import auth, upload, wardrobe, recommend, skin_tone, images
+from routers import auth, upload, wardrobe, recommend, skin_tone, images, chat
 from database import init_db
 
 app = FastAPI(
@@ -40,6 +40,7 @@ app.include_router(wardrobe.router, prefix="/wardrobe", tags=["Wardrobe"])
 app.include_router(recommend.router, prefix="/recommend", tags=["Recommend"])
 app.include_router(skin_tone.router, prefix="", tags=["Skin Tone"])
 app.include_router(images.router, prefix="/images", tags=["Images"])
+app.include_router(chat.router,   prefix="/chat",   tags=["Chat"])
 
 # Root-level aliases so the mobile app can call /remove-bg and /style-image directly
 # (same handlers, just exposed at the root path the frontend expects)

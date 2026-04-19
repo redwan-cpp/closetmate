@@ -11,7 +11,9 @@ closetmate/android/
 
 # ── Python backend ────────────────────────────────────
 closetmate-ai/venv/
+closetmate-ai/**/__pycache__/
 closetmate-ai/__pycache__/
+closetmate-ai/**/*.pyc
 closetmate-ai/*.pyc
 closetmate-ai/.env
 closetmate-ai/closetmate.db

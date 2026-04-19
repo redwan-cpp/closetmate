@@ -398,3 +398,74 @@ export async function styleImage(uri: string): Promise<string> {
 
   return `data:image/jpeg;base64,${base64}`;
 }
+
+// ---------------------------------------------------------------------------
+// Chat types
+// ---------------------------------------------------------------------------
+
+export interface ChatHistoryEntry {
+  role: "user" | "assistant";
+  content: string;
+}
+
+export interface SuggestedOutfitItem {
+  subcategory: string;
+  color: string;
+}
+
+export interface ChatResponse {
+  reply: string;
+  suggested_items: SuggestedOutfitItem[] | null;
+}
+
+// ---------------------------------------------------------------------------
+// sendChatMessage — POST /chat/message
+// ---------------------------------------------------------------------------
+
+/**
+ * Send a message to the ClosetMate AI stylist.
+ * The backend loads the user's wardrobe, builds context, and calls GPT-4o-mini.
+ */
+export async function sendChatMessage(
+  userId: string,
+  message: string,
+  history: ChatHistoryEntry[] = []
+): Promise<ChatResponse> {
+  const url = `${AI_BASE_URL}/chat/message`;
+  console.log("[sendChatMessage] POST", url);
+
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), 28000); // 28s — just after backend's 25s hard kill
+
+  let response: Response;
+  try {
+    response = await fetch(url, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ user_id: userId, message, history }),
+      signal: controller.signal,
+    });
+  } catch (e) {
+    clearTimeout(timeout);
+    if (e instanceof Error && e.name === "AbortError") {
+      throw new Error("Request timed out after 30s. The AI stylist took too long to respond.");
+    }
+    const msg = e instanceof Error ? e.message : String(e);
+    throw new Error(`Cannot reach backend at ${url}.\n${msg}`);
+  } finally {
+    clearTimeout(timeout);
+  }
+
+  if (!response.ok) {
+    const text = await response.text().catch(() => "");
+    throw new Error(
+      `Chat failed (HTTP ${response.status})` +
+        (text ? `:\n${text.slice(0, 200)}` : "")
+    );
+  }
+
+  const json = await response.json();
+  console.log("[sendChatMessage] reply length:", (json as ChatResponse).reply?.length);
+  return json as ChatResponse;
+}
+

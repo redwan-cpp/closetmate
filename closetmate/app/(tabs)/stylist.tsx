@@ -1,130 +1,417 @@
-import React, { useState } from 'react';
+/**
+ * app/(tabs)/stylist.tsx
+ * ─────────────────────────────────────────────
+ * ClosetMate AI Stylist — full conversational chat UI
+ * Features:
+ *  · Live FlatList chat (auto-scroll to bottom)
+ *  · Animated 3-dot typing indicator
+ *  · Outfit suggestion cards rendered inline
+ *  · Quick-prompt chips on first load
+ *  · Proper keyboard avoidance
+ *  · Error bubbles when backend is unreachable
+ * ─────────────────────────────────────────────
+ */
+
+import React, {
+  useState,
+  useRef,
+  useCallback,
+  useEffect,
+} from 'react';
 import {
   View,
   Text,
-  ScrollView,
-  StyleSheet,
-  Image,
-  TouchableOpacity,
-  useColorScheme,
-  Dimensions,
+  FlatList,
   TextInput,
+  TouchableOpacity,
+  StyleSheet,
   KeyboardAvoidingView,
   Platform,
+  ActivityIndicator,
+  Animated,
+  Easing,
+  useColorScheme,
+  Dimensions,
 } from 'react-native';
 import { SafeAreaView } from 'react-native-safe-area-context';
 import { Ionicons } from '@expo/vector-icons';
+import {
+  sendChatMessage,
+  ChatHistoryEntry,
+  SuggestedOutfitItem,
+} from '@/src/api/ai';
 
 const { width } = Dimensions.get('window');
+const DEMO_USER_ID = 'demo_user';
+
+// ─────────────────────────────────────────────
+// Types
+// ─────────────────────────────────────────────
+
+type MessageRole = 'user' | 'assistant' | 'error';
+
+interface ChatMessage {
+  id: string;
+  role: MessageRole;
+  text: string;
+  outfitItems?: SuggestedOutfitItem[] | null;
+  timestamp: Date;
+}
+
+// ─────────────────────────────────────────────
+// Quick prompt chips (shown before first message)
+// ─────────────────────────────────────────────
+
+
+
+// ─────────────────────────────────────────────
+// Typing indicator — 3 animated dots
+// ─────────────────────────────────────────────
+
+function TypingIndicator({ isDark }: { isDark: boolean }) {
+  const dots = [
+    useRef(new Animated.Value(0)).current,
+    useRef(new Animated.Value(0)).current,
+    useRef(new Animated.Value(0)).current,
+  ];
+
+  useEffect(() => {
+    const animations = dots.map((dot, i) =>
+      Animated.loop(
+        Animated.sequence([
+          Animated.delay(i * 150),
+          Animated.timing(dot, {
+            toValue: 1,
+            duration: 350,
+            easing: Easing.inOut(Easing.ease),
+            useNativeDriver: true,
+          }),
+          Animated.timing(dot, {
+            toValue: 0,
+            duration: 350,
+            easing: Easing.inOut(Easing.ease),
+            useNativeDriver: true,
+          }),
+          Animated.delay((dots.length - i - 1) * 150),
+        ])
+      )
+    );
+    Animated.parallel(animations).start();
+    return () => animations.forEach(a => a.stop());
+  }, []);
+
+  return (
+    <View style={styles.aiRow}>
+      <View style={[styles.cmBadge, { backgroundColor: isDark ? '#2C2C2E' : '#F0F0F0' }]}>
+        <Text style={[styles.cmBadgeText, { color: isDark ? '#FFF' : '#000' }]}>✦</Text>
+      </View>
+      <View style={[styles.aiBubble, { backgroundColor: isDark ? '#1C1C1E' : '#F2F2F7' }]}>
+        <View style={styles.dotsRow}>
+          {dots.map((dot, i) => (
+            <Animated.View
+              key={i}
+              style={[
+                styles.dot,
+                {
+                  backgroundColor: isDark ? '#AEAEB2' : '#8E8E93',
+                  opacity: dot,
+                  transform: [
+                    {
+                      translateY: dot.interpolate({
+                        inputRange: [0, 1],
+                        outputRange: [0, -4],
+                      }),
+                    },
+                  ],
+                },
+              ]}
+            />
+          ))}
+        </View>
+      </View>
+    </View>
+  );
+}
+
+// ─────────────────────────────────────────────
+// Outfit chip — inline item from AI suggestion
+// ─────────────────────────────────────────────
+
+const COLOR_HEX: Record<string, string> = {
+  white: '#F5F5F5', cream: '#FFF8E1', beige: '#D7CCC8', black: '#212121',
+  grey: '#9E9E9E', gray: '#9E9E9E', navy: '#1A237E', blue: '#1E88E5',
+  red: '#E53935', maroon: '#880E4F', green: '#388E3C', olive: '#827717',
+  yellow: '#FDD835', golden: '#F59F00', gold: '#F59F00', orange: '#FB8C00',
+  pink: '#F06292', purple: '#8E24AA', brown: '#6D4C41', teal: '#00897B',
+  mustard: '#F9A825', coral: '#FF7043', lavender: '#9575CD', sky_blue: '#03A9F4',
+};
+
+function OutfitItemChip({ item, isDark }: { item: SuggestedOutfitItem; isDark: boolean }) {
+  const dot = COLOR_HEX[item.color.toLowerCase().replace(' ', '_')] ?? '#AAA';
+  return (
+    <View style={[styles.chip, { backgroundColor: isDark ? '#2C2C2E' : '#E8E8ED' }]}>
+      <View style={[styles.chipDot, { backgroundColor: dot }]} />
+      <Text style={[styles.chipText, { color: isDark ? '#FFF' : '#1C1C1E' }]}>
+        {item.color} {item.subcategory}
+      </Text>
+    </View>
+  );
+}
+
+// ─────────────────────────────────────────────
+// Single message bubble
+// ─────────────────────────────────────────────
+
+interface BubbleProps {
+  msg: ChatMessage;
+  isDark: boolean;
+}
+
+function Bubble({ msg, isDark }: BubbleProps) {
+  if (msg.role === 'user') {
+    return (
+      <View style={styles.userRow}>
+        <View style={[styles.userBubble, { backgroundColor: isDark ? '#1C1C1E' : '#1A1A1A' }]}>
+          <Text style={styles.userText}>{msg.text}</Text>
+        </View>
+      </View>
+    );
+  }
+
+  if (msg.role === 'error') {
+    return (
+      <View style={styles.aiRow}>
+        <View style={[styles.cmBadge, { backgroundColor: '#FF3B30' }]}>
+          <Ionicons name="alert" size={12} color="#FFF" />
+        </View>
+        <View style={[styles.aiBubble, { backgroundColor: isDark ? '#2C1010' : '#FFF2F2', borderColor: '#FF3B30', borderWidth: 1 }]}>
+          <Text style={[styles.aiText, { color: isDark ? '#FF6B6B' : '#CC2929' }]}>{msg.text}</Text>
+        </View>
+      </View>
+    );
+  }
+
+  // Assistant
+  return (
+    <View style={styles.aiRow}>
+      <View style={[styles.cmBadge, { backgroundColor: isDark ? '#2C2C2E' : '#F0F0F0' }]}>
+        <Text style={[styles.cmBadgeText, { color: isDark ? '#FFF' : '#000' }]}>✦</Text>
+      </View>
+      <View style={{ flex: 1 }}>
+        <View style={[styles.aiBubble, { backgroundColor: isDark ? '#1C1C1E' : '#F2F2F7' }]}>
+          <Text style={[styles.aiText, { color: isDark ? '#FFF' : '#1C1C1E' }]}>{msg.text}</Text>
+        </View>
+        {msg.outfitItems && msg.outfitItems.length > 0 && (
+          <View style={styles.chipRow}>
+            <Text style={[styles.chipLabel, { color: isDark ? '#8E8E93' : '#636366' }]}>
+              Suggested outfit ✦
+            </Text>
+            <View style={styles.chips}>
+              {msg.outfitItems.map((item, i) => (
+                <OutfitItemChip key={i} item={item} isDark={isDark} />
+              ))}
+            </View>
+          </View>
+        )}
+      </View>
+    </View>
+  );
+}
+
+// ─────────────────────────────────────────────
+// Main screen
+// ─────────────────────────────────────────────
 
 export default function StylistScreen() {
   const colorScheme = useColorScheme();
   const isDark = colorScheme === 'dark';
-  const [inputText, setInputText] = useState('');
 
-  const styles = createStyles(isDark);
+  const [messages, setMessages] = useState<ChatMessage[]>([]);
+  const [inputText, setInputText] = useState('');
+  const [isThinking, setIsThinking] = useState(false);
+
+  const flatRef = useRef<FlatList>(null);
+  const inputRef = useRef<TextInput>(null);
+
+  // Build history from messages for backend context
+  const buildHistory = useCallback((): ChatHistoryEntry[] => {
+    return messages
+      .filter(m => m.role === 'user' || m.role === 'assistant')
+      .slice(-6)
+      .map(m => ({
+        role: m.role as 'user' | 'assistant',
+        content: m.text,
+      }));
+  }, [messages]);
+
+  const scrollToBottom = useCallback(() => {
+    setTimeout(() => {
+      flatRef.current?.scrollToEnd({ animated: true });
+    }, 80);
+  }, []);
+
+  const sendMessage = useCallback(
+    async (text: string) => {
+      const trimmed = text.trim();
+      if (!trimmed || isThinking) return;
+
+      setInputText('');
+      setIsThinking(true);
+
+      const userMsg: ChatMessage = {
+        id: `u-${Date.now()}`,
+        role: 'user',
+        text: trimmed,
+        timestamp: new Date(),
+      };
+
+      setMessages(prev => [...prev, userMsg]);
+      scrollToBottom();
+
+      try {
+        const history = buildHistory();
+        const result = await sendChatMessage(DEMO_USER_ID, trimmed, history);
+
+        const aiMsg: ChatMessage = {
+          id: `a-${Date.now()}`,
+          role: 'assistant',
+          text: result.reply,
+          outfitItems: result.suggested_items,
+          timestamp: new Date(),
+        };
+        setMessages(prev => [...prev, aiMsg]);
+      } catch (e) {
+        const detail = e instanceof Error ? e.message : String(e);
+        const errMsg: ChatMessage = {
+          id: `e-${Date.now()}`,
+          role: 'error',
+          text: `Stylist error: ${detail}`,
+          timestamp: new Date(),
+        };
+        setMessages(prev => [...prev, errMsg]);
+      } finally {
+        setIsThinking(false);
+        scrollToBottom();
+      }
+    },
+    [isThinking, buildHistory, scrollToBottom]
+  );
+
+  const handleSend = useCallback(() => sendMessage(inputText), [inputText, sendMessage]);
+
+
+
+  const isEmpty = messages.length === 0 && !isThinking;
 
   return (
-    <SafeAreaView style={styles.container}>
+    <SafeAreaView style={[styles.safe, { backgroundColor: isDark ? '#000' : '#FFF' }]}>
       <KeyboardAvoidingView
         style={styles.flex}
         behavior={Platform.OS === 'ios' ? 'padding' : undefined}
         keyboardVerticalOffset={Platform.OS === 'ios' ? 90 : 0}
       >
-        <ScrollView
-          style={styles.scrollView}
-          contentContainerStyle={styles.scrollContent}
-          showsVerticalScrollIndicator={false}
-          keyboardShouldPersistTaps="handled"
-        >
-          {/* Header */}
-          <Text style={styles.header}>Stylist</Text>
-
-          {/* User Message - right aligned */}
-          <View style={styles.userMessageContainer}>
-            <View style={styles.userBubble}>
-              <Text style={styles.userBubbleText}>
-                I have a Holud ceremony tonight. Something festive but comfy.
-              </Text>
-            </View>
-          </View>
-
-          {/* AI Response - left aligned with CM badge */}
-          <View style={styles.aiMessageContainer}>
-            <View style={styles.aiBadge}>
-              <Text style={styles.aiBadgeText}>CM</Text>
-            </View>
-            <View style={styles.aiBubble}>
-              <Text style={styles.aiBubbleText}>
-                Exciting! For a Holud, let's go vibrant and breathable. How about this combination?
-              </Text>
-            </View>
-          </View>
-
-        {/* Outfit Card */}
-        <View style={styles.outfitCard}>
-          {/* Outfit Images Grid */}
-          <View style={styles.outfitGrid}>
-            {/* Left side - Large image */}
-            <View style={styles.outfitImageLarge}>
-              <Image
-                source={{ uri: 'https://images.unsplash.com/photo-1610701596007-11502861dcfa?w=400&h=600&fit=crop' }}
-                style={styles.imageFill}
-                resizeMode="cover"
-              />
-            </View>
-
-            {/* Right side - Small images */}
-            <View style={styles.outfitImagesRight}>
-              <View style={styles.outfitImageSmall}>
-                <Image
-                  source={{ uri: 'https://images.unsplash.com/photo-1535632066927-ab7c9ab60908?w=200&h=200&fit=crop' }}
-                  style={styles.imageFill}
-                  resizeMode="cover"
-                />
-              </View>
-              <View style={styles.outfitImageSmall}>
-                <Image
-                  source={{ uri: 'https://images.unsplash.com/photo-1543163521-1bf539c55dd2?w=200&h=200&fit=crop' }}
-                  style={styles.imageFill}
-                  resizeMode="cover"
-                />
-              </View>
-            </View>
-          </View>
-
-          {/* Why it works section */}
-          <View style={styles.whyItWorksSection}>
-            <Text style={styles.whyItWorksTitle}>Why it works:</Text>
-            <Text style={styles.whyItWorksText}>
-              The mustard yellow complements your warm undertones beautifully for an evening event. The block heels ensure comfort for dancing.
+        {/* ── Header ── */}
+        <View style={styles.header}>
+          <View>
+            <Text style={[styles.headerTitle, { color: isDark ? '#FFF' : '#1A1A1A' }]}>
+              AI Stylist
+            </Text>
+            <Text style={[styles.headerSub, { color: isDark ? '#8E8E93' : '#6C6C70' }]}>
+              Powered by your wardrobe
             </Text>
           </View>
-
-          {/* CTA Button */}
-          <TouchableOpacity style={styles.ctaButton} activeOpacity={0.8}>
-            <Text style={styles.ctaButtonText}>I'm wearing this today</Text>
-            <View style={styles.checkmark}>
-              <Text style={styles.checkmarkText}>✓</Text>
-            </View>
-          </TouchableOpacity>
+          <View style={[styles.statusDot, { backgroundColor: '#30D158' }]} />
         </View>
-        </ScrollView>
 
-        {/* Chat input bar */}
-        <View style={[styles.inputBar, { backgroundColor: isDark ? '#1C1C1E' : '#F2F2F7' }]}>
-          <TouchableOpacity style={styles.inputIcon} hitSlop={{ top: 12, bottom: 12, left: 12, right: 12 }}>
-            <Ionicons name="camera-outline" size={24} color={isDark ? '#AEAEB2' : '#3C3C43'} />
-          </TouchableOpacity>
+        {/* ── Empty welcome state ── */}
+        {isEmpty && (
+          <View style={styles.welcomeArea}>
+            <View style={[styles.welcomeBadge, { backgroundColor: isDark ? '#1C1C1E' : '#F2F2F7' }]}>
+              <Text style={styles.welcomeEmoji}>✦</Text>
+              <Text style={[styles.welcomeTitle, { color: isDark ? '#FFF' : '#1A1A1A' }]}>
+                Your personal stylist
+              </Text>
+              <Text style={[styles.welcomeSub, { color: isDark ? '#AEAEB2' : '#6C6C70' }]}>
+                Ask me about any occasion, get outfit suggestions from your actual wardrobe, or get style advice.
+              </Text>
+            </View>
+
+
+          </View>
+        )}
+
+        {/* ── Message list ── */}
+        {!isEmpty && (
+          <FlatList
+            ref={flatRef}
+            data={messages}
+            keyExtractor={m => m.id}
+            contentContainerStyle={styles.messageList}
+            showsVerticalScrollIndicator={false}
+            onContentSizeChange={scrollToBottom}
+            renderItem={({ item }) => <Bubble msg={item} isDark={isDark} />}
+            ListFooterComponent={isThinking ? <TypingIndicator isDark={isDark} /> : null}
+          />
+        )}
+
+        {/* Thinking state when list is empty (first message) */}
+        {isEmpty && isThinking && (
+          <View style={styles.firstThinkWrap}>
+            <TypingIndicator isDark={isDark} />
+          </View>
+        )}
+
+        {/* ── Input bar ── */}
+        <View
+          style={[
+            styles.inputBar,
+            {
+              backgroundColor: isDark ? '#1C1C1E' : '#F2F2F7',
+              borderTopColor: isDark ? '#2C2C2E' : '#E5E5EA',
+            },
+          ]}
+        >
           <TextInput
-            style={[styles.textInput, { color: isDark ? '#FFFFFF' : '#000000' }]}
-            placeholder="Message..."
-            placeholderTextColor={isDark ? '#636366' : '#8E8E93'}
+            ref={inputRef}
+            style={[
+              styles.textInput,
+              {
+                color: isDark ? '#FFF' : '#1A1A1A',
+                backgroundColor: isDark ? '#2C2C2E' : '#E8E8ED',
+              },
+            ]}
+            placeholder="Message your stylist…"
+            placeholderTextColor={isDark ? '#636366' : '#AEAEB2'}
             value={inputText}
             onChangeText={setInputText}
+            onSubmitEditing={handleSend}
+            returnKeyType="send"
+            multiline
+            maxLength={500}
           />
-          <TouchableOpacity style={styles.inputIcon} hitSlop={{ top: 12, bottom: 12, left: 12, right: 12 }}>
-            <Ionicons name="mic-outline" size={24} color={isDark ? '#AEAEB2' : '#3C3C43'} />
+          <TouchableOpacity
+            onPress={handleSend}
+            disabled={!inputText.trim() || isThinking}
+            style={[
+              styles.sendButton,
+              {
+                backgroundColor:
+                  inputText.trim() && !isThinking
+                    ? isDark ? '#FFF' : '#1A1A1A'
+                    : isDark ? '#3A3A3C' : '#D1D1D6',
+              },
+            ]}
+            activeOpacity={0.8}
+          >
+            {isThinking ? (
+              <ActivityIndicator size="small" color={isDark ? '#000' : '#FFF'} />
+            ) : (
+              <Ionicons
+                name="arrow-up"
+                size={18}
+                color={inputText.trim() ? (isDark ? '#000' : '#FFF') : isDark ? '#636366' : '#8E8E93'}
+              />
+            )}
           </TouchableOpacity>
         </View>
       </KeyboardAvoidingView>
@@ -132,186 +419,216 @@ export default function StylistScreen() {
   );
 }
 
-function createStyles(isDark: boolean) {
-  return StyleSheet.create({
-    flex: { flex: 1 },
-    container: {
-      flex: 1,
-      backgroundColor: isDark ? '#000000' : '#FFFFFF',
-    },
-    scrollView: {
-      flex: 1,
-    },
-    scrollContent: {
-      paddingHorizontal: 20,
-      paddingTop: 8,
-      paddingBottom: 24,
-    },
-    header: {
-      fontSize: 34,
-      fontWeight: '700',
-      color: isDark ? '#FFFFFF' : '#000000',
-      marginBottom: 24,
-      letterSpacing: -0.5,
-    },
+// ─────────────────────────────────────────────
+// Styles
+// ─────────────────────────────────────────────
 
-    // User Message - right aligned
-    userMessageContainer: {
-      flexDirection: 'row',
-      justifyContent: 'flex-end',
-      marginBottom: 16,
-    },
-    userBubble: {
-      maxWidth: '85%',
-      backgroundColor: isDark ? '#2C2C2E' : '#1C1C1E',
-      borderRadius: 18,
-      padding: 14,
-      borderBottomRightRadius: 4,
-    },
-    userBubbleText: {
-      fontSize: 15,
-      lineHeight: 20,
-      color: '#FFFFFF',
-    },
+const styles = StyleSheet.create({
+  safe: { flex: 1 },
+  flex: { flex: 1 },
 
-    // AI Message - left with CM badge
-    aiMessageContainer: {
-      flexDirection: 'row',
-      alignItems: 'flex-end',
-      marginBottom: 20,
-      gap: 8,
-    },
-    aiBadge: {
-      width: 28,
-      height: 28,
-      borderRadius: 14,
-      backgroundColor: isDark ? '#3A3A3C' : '#E5E5EA',
-      justifyContent: 'center',
-      alignItems: 'center',
-    },
-    aiBadgeText: {
-      fontSize: 10,
-      fontWeight: '700',
-      color: isDark ? '#FFFFFF' : '#000000',
-    },
-    aiBubble: {
-      flex: 1,
-      backgroundColor: isDark ? '#1C1C1E' : '#F2F2F7',
-      borderRadius: 18,
-      padding: 14,
-      borderBottomLeftRadius: 4,
-    },
-    aiBubbleText: {
-      fontSize: 15,
-      lineHeight: 20,
-      color: isDark ? '#FFFFFF' : '#000000',
-    },
+  // Header
+  header: {
+    flexDirection: 'row',
+    justifyContent: 'space-between',
+    alignItems: 'center',
+    paddingHorizontal: 20,
+    paddingTop: 8,
+    paddingBottom: 12,
+  },
+  headerTitle: {
+    fontSize: 28,
+    fontWeight: '700',
+    letterSpacing: -0.5,
+  },
+  headerSub: {
+    fontSize: 13,
+    marginTop: 1,
+  },
+  statusDot: {
+    width: 10,
+    height: 10,
+    borderRadius: 5,
+  },
 
-    // Outfit Card
-    outfitCard: {
-      backgroundColor: isDark ? '#1C1C1E' : '#FFFFFF',
-      borderRadius: 20,
-      padding: 16,
-      marginLeft: 36,
-      borderWidth: isDark ? 0 : 1,
-      borderColor: isDark ? 'transparent' : '#E5E5EA',
-      shadowColor: '#000',
-      shadowOffset: { width: 0, height: 2 },
-      shadowOpacity: isDark ? 0.3 : 0.08,
-      shadowRadius: 8,
-      elevation: 3,
-    },
-    outfitGrid: {
-      flexDirection: 'row',
-      gap: 12,
-      marginBottom: 16,
-    },
-    outfitImageLarge: {
-      flex: 2,
-      aspectRatio: 0.75,
-      borderRadius: 12,
-      overflow: 'hidden',
-      backgroundColor: isDark ? '#2C2C2E' : '#F2F2F7',
-    },
-    outfitImagesRight: {
-      flex: 1,
-      gap: 12,
-    },
-    outfitImageSmall: {
-      flex: 1,
-      borderRadius: 12,
-      overflow: 'hidden',
-      backgroundColor: isDark ? '#2C2C2E' : '#F2F2F7',
-    },
-    imageFill: {
-      width: '100%',
-      height: '100%',
-    },
-    whyItWorksSection: {
-      marginBottom: 16,
-    },
-    whyItWorksTitle: {
-      fontSize: 15,
-      fontWeight: '600',
-      color: isDark ? '#FFFFFF' : '#000000',
-      marginBottom: 6,
-    },
-    whyItWorksText: {
-      fontSize: 14,
-      lineHeight: 19,
-      color: isDark ? '#AEAEB2' : '#3C3C43',
-    },
-    ctaButton: {
-      flexDirection: 'row',
-      alignItems: 'center',
-      justifyContent: 'center',
-      backgroundColor: '#FF6B6B',
-      borderRadius: 12,
-      paddingVertical: 14,
-      paddingHorizontal: 20,
-      gap: 8,
-    },
-    ctaButtonText: {
-      fontSize: 16,
-      fontWeight: '600',
-      color: '#FFFFFF',
-    },
-    checkmark: {
-      width: 20,
-      height: 20,
-      borderRadius: 10,
-      backgroundColor: 'rgba(255, 255, 255, 0.3)',
-      justifyContent: 'center',
-      alignItems: 'center',
-    },
-    checkmarkText: {
-      fontSize: 12,
-      color: '#FFFFFF',
-      fontWeight: '700',
-    },
+  // Welcome / empty state
+  welcomeArea: {
+    flex: 1,
+    paddingHorizontal: 20,
+    paddingTop: 16,
+  },
+  welcomeBadge: {
+    borderRadius: 20,
+    padding: 20,
+    alignItems: 'center',
+    marginBottom: 20,
+  },
+  welcomeEmoji: {
+    fontSize: 28,
+    marginBottom: 10,
+  },
+  welcomeTitle: {
+    fontSize: 19,
+    fontWeight: '700',
+    marginBottom: 8,
+    letterSpacing: -0.3,
+  },
+  welcomeSub: {
+    fontSize: 14,
+    lineHeight: 20,
+    textAlign: 'center',
+  },
+  quickPromptWrap: {
+    flexDirection: 'row',
+    flexWrap: 'wrap',
+    gap: 8,
+  },
+  quickChip: {
+    borderRadius: 20,
+    borderWidth: 1,
+    paddingHorizontal: 14,
+    paddingVertical: 9,
+  },
+  quickChipText: {
+    fontSize: 14,
+    fontWeight: '500',
+  },
 
-    // Input bar
-    inputBar: {
-      flexDirection: 'row',
-      alignItems: 'center',
-      paddingHorizontal: 12,
-      paddingVertical: 10,
-      paddingBottom: Platform.OS === 'ios' ? 28 : 10,
-      borderTopWidth: StyleSheet.hairlineWidth,
-      borderTopColor: 'rgba(128,128,128,0.3)',
-    },
-    inputIcon: {
-      padding: 4,
-    },
-    textInput: {
-      flex: 1,
-      fontSize: 16,
-      paddingVertical: 10,
-      paddingHorizontal: 16,
-      marginHorizontal: 8,
-      borderRadius: 20,
-      backgroundColor: 'rgba(128,128,128,0.15)',
-      maxHeight: 100,
-    },
-  });
-}
+  // Message list
+  messageList: {
+    paddingHorizontal: 16,
+    paddingTop: 8,
+    paddingBottom: 16,
+    gap: 12,
+  },
+
+  // User bubble
+  userRow: {
+    flexDirection: 'row',
+    justifyContent: 'flex-end',
+  },
+  userBubble: {
+    maxWidth: width * 0.78,
+    borderRadius: 20,
+    borderBottomRightRadius: 5,
+    paddingHorizontal: 16,
+    paddingVertical: 12,
+  },
+  userText: {
+    fontSize: 15,
+    lineHeight: 21,
+    color: '#FFF',
+  },
+
+  // AI bubble
+  aiRow: {
+    flexDirection: 'row',
+    alignItems: 'flex-start',
+    gap: 8,
+  },
+  cmBadge: {
+    width: 30,
+    height: 30,
+    borderRadius: 15,
+    justifyContent: 'center',
+    alignItems: 'center',
+    marginTop: 2,
+    flexShrink: 0,
+  },
+  cmBadgeText: {
+    fontSize: 13,
+    fontWeight: '700',
+  },
+  aiBubble: {
+    flex: 1,
+    borderRadius: 20,
+    borderBottomLeftRadius: 5,
+    paddingHorizontal: 16,
+    paddingVertical: 12,
+  },
+  aiText: {
+    fontSize: 15,
+    lineHeight: 22,
+  },
+
+  // Outfit chips
+  chipRow: {
+    marginTop: 6,
+    paddingLeft: 0,
+  },
+  chipLabel: {
+    fontSize: 11,
+    fontWeight: '600',
+    textTransform: 'uppercase',
+    letterSpacing: 0.5,
+    marginBottom: 6,
+  },
+  chips: {
+    flexDirection: 'row',
+    flexWrap: 'wrap',
+    gap: 6,
+  },
+  chip: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    borderRadius: 12,
+    paddingHorizontal: 10,
+    paddingVertical: 5,
+    gap: 6,
+  },
+  chipDot: {
+    width: 10,
+    height: 10,
+    borderRadius: 5,
+  },
+  chipText: {
+    fontSize: 13,
+    fontWeight: '500',
+    textTransform: 'capitalize',
+  },
+
+  // Typing dots
+  dotsRow: {
+    flexDirection: 'row',
+    gap: 5,
+    paddingVertical: 4,
+  },
+  dot: {
+    width: 7,
+    height: 7,
+    borderRadius: 4,
+  },
+
+  firstThinkWrap: {
+    paddingHorizontal: 16,
+    marginTop: 8,
+  },
+
+  // Input bar
+  inputBar: {
+    flexDirection: 'row',
+    alignItems: 'flex-end',
+    paddingHorizontal: 12,
+    paddingVertical: 10,
+    paddingBottom: Platform.OS === 'ios' ? 28 : 10,
+    borderTopWidth: StyleSheet.hairlineWidth,
+    gap: 8,
+  },
+  textInput: {
+    flex: 1,
+    fontSize: 15,
+    paddingHorizontal: 16,
+    paddingVertical: 10,
+    borderRadius: 22,
+    maxHeight: 110,
+    lineHeight: 20,
+  },
+  sendButton: {
+    width: 36,
+    height: 36,
+    borderRadius: 18,
+    justifyContent: 'center',
+    alignItems: 'center',
+    marginBottom: 2,
+  },
+});

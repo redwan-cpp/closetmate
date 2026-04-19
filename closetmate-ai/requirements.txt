@@ -16,6 +16,7 @@ onnxruntime
 google-generativeai
 openai
 requests
+httpx
 
 # ── Auth ──────────────────────────────────────────────────────────────────────
 passlib[bcrypt]
