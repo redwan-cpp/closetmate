@@ -435,7 +435,7 @@ export async function sendChatMessage(
   console.log("[sendChatMessage] POST", url);
 
   const controller = new AbortController();
-  const timeout = setTimeout(() => controller.abort(), 28000); // 28s — just after backend's 25s hard kill
+  const timeout = setTimeout(() => controller.abort(), 15000); // 15s — just after backend's 12s hard kill
 
   let response: Response;
   try {

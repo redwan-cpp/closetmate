@@ -62,11 +62,17 @@ interface ChatMessage {
 // Quick prompt chips (shown before first message)
 // ─────────────────────────────────────────────
 
-
-
 // ─────────────────────────────────────────────
-// Typing indicator — 3 animated dots
+// Quick prompt chips (shown before first message)
 // ─────────────────────────────────────────────
+
+const QUICK_PROMPTS = [
+  'Recommend an outfit for today',
+  'What should I wear to a wedding?',
+  'Suggest something casual',
+  'Outfit for the office',
+];
+
 
 function TypingIndicator({ isDark }: { isDark: boolean }) {
   const dots = [
@@ -336,6 +342,25 @@ export default function StylistScreen() {
               </Text>
             </View>
 
+            {/* Quick prompt chips */}
+            <View style={styles.quickPromptWrap}>
+              {QUICK_PROMPTS.map((prompt) => (
+                <TouchableOpacity
+                  key={prompt}
+                  style={[
+                    styles.quickChip,
+                    { borderColor: isDark ? '#3A3A3C' : '#D1D1D6',
+                      backgroundColor: isDark ? '#1C1C1E' : '#F2F2F7' },
+                  ]}
+                  onPress={() => sendMessage(prompt)}
+                  activeOpacity={0.7}
+                >
+                  <Text style={[styles.quickChipText, { color: isDark ? '#FFF' : '#1C1C1E' }]}>
+                    {prompt}
+                  </Text>
+                </TouchableOpacity>
+              ))}
+            </View>
 
           </View>
         )}
