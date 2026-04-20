@@ -45,8 +45,10 @@ class AnalyzeClothingResponse(BaseModel):
 @router.post("/upload-clothing", response_model=UploadClothingResponse)
 async def upload_clothing(file: UploadFile = File(...)) -> UploadClothingResponse:
     """
-    Upload a clothing image, run background removal, and save the result under
-    uploads/processed/. Returns the path to the processed image.
+    Upload a clothing image, attempt background removal, and save the result
+    under uploads/processed/. If background removal fails the original image
+    is saved instead so the caller always gets a valid server-side path.
+    Returns the relative path to the saved image.
     """
     if not file.content_type or not file.content_type.startswith("image/"):
         raise HTTPException(status_code=400, detail="File must be an image")
@@ -60,28 +62,36 @@ async def upload_clothing(file: UploadFile = File(...)) -> UploadClothingRespons
         raise HTTPException(status_code=400, detail="Empty file")
 
     suffix = Path(file.filename or "image").suffix or ".jpg"
-    # On Windows, NamedTemporaryFile with delete=True holds an exclusive lock,
-    # preventing other code from opening the file by path. Use delete=False and
-    # clean up manually in a finally block instead.
     tmp_path = None
     try:
         with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
             tmp.write(body)
-            tmp_path = tmp.name  # file is closed after the with-block exits
+            tmp_path = tmp.name
 
+        # ── Try background removal first ─────────────────────────────────────
         try:
             image_path = remove_background_and_save_from_path(tmp_path)
-        except ValueError as e:
-            raise HTTPException(status_code=400, detail=str(e)) from e
-        except Exception as e:
-            raise HTTPException(status_code=500, detail=f"Processing failed: {e}") from e
+            status = "background_removed"
+        except Exception as bg_err:
+            # Background removal failed — save the original image as a fallback
+            import uuid as _uuid
+            from pathlib import Path as _Path
+            fallback_dir = _Path(__file__).resolve().parent.parent / "uploads" / "processed"
+            fallback_dir.mkdir(parents=True, exist_ok=True)
+            fallback_name = f"{_uuid.uuid4().hex}{suffix}"
+            fallback_path = fallback_dir / fallback_name
+            fallback_path.write_bytes(body)
+            image_path = f"uploads/processed/{fallback_name}"
+            status = "original_saved"
+            print(f"[upload-clothing] Background removal failed ({bg_err}); saved original as {image_path}")
+
     finally:
         if tmp_path and os.path.exists(tmp_path):
             os.unlink(tmp_path)
 
     return UploadClothingResponse(
         image_path=image_path,
-        status="background_removed",
+        status=status,
     )
 
 

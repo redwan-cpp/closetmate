@@ -16,6 +16,7 @@ from services.cultural_context import (
     detect_culture_from_garment,
     CULTURAL_PROFILES,
 )
+from services.outfit_rules import validate_outfit, fix_outfit
 
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 
@@ -386,6 +387,14 @@ def build_outfits(
         if ow:
             outfit_items.append(ow)
 
+        # ── Validate / fix before appending ──────────────────────────────
+        is_valid, reason = validate_outfit(outfit_items)
+        if not is_valid:
+            outfit_items = fix_outfit(outfit_items)
+            is_valid, reason = validate_outfit(outfit_items)
+            if not is_valid:
+                continue  # skip permanently invalid outfits
+
         total_score, breakdown = score_outfit(outfit_items, occasion, weather_cat, culture)
         outfits.append({
             "type":      "full_body",
@@ -406,6 +415,14 @@ def build_outfits(
             ow = best_outerwear(normalize(top.get("subcategory", "")), culture)
             if ow:
                 outfit_items.append(ow)
+
+            # ── Validate / fix before appending ──────────────────────────
+            is_valid, reason = validate_outfit(outfit_items)
+            if not is_valid:
+                outfit_items = fix_outfit(outfit_items)
+                is_valid, reason = validate_outfit(outfit_items)
+                if not is_valid:
+                    continue  # skip permanently invalid outfits
 
             total_score, breakdown = score_outfit(outfit_items, occasion, weather_cat, culture)
             outfits.append({

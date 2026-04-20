@@ -4,8 +4,20 @@ try:
 except ImportError:
     pass
 
-import os
-from fastapi import FastAPI
+# Manual .env loader — runs even when python-dotenv is not installed
+import os, pathlib
+_env_file = pathlib.Path(__file__).parent / ".env"
+if _env_file.exists():
+    for _line in _env_file.read_text(encoding="utf-8").splitlines():
+        _line = _line.strip()
+        if _line and not _line.startswith("#") and "=" in _line:
+            _k, _, _v = _line.partition("=")
+            if _k.strip() not in os.environ:  # don't overwrite real env vars
+                os.environ[_k.strip()] = _v.strip().strip('"').strip("'")
+
+import traceback as _tb
+from fastapi import FastAPI, Request
+from fastapi.responses import JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 from routers import auth, upload, wardrobe, recommend, skin_tone, images, chat
@@ -16,6 +28,18 @@ app = FastAPI(
   description="AI-powered wardrobe management and outfit recommendation API",
   version="0.1.0",
 )
+
+
+@app.exception_handler(Exception)
+async def _global_exception_handler(request: Request, exc: Exception):
+    """Surface the real traceback in the JSON response during development."""
+    import logging
+    logging.getLogger("closetmate").exception("Unhandled exception: %s", exc)
+    return JSONResponse(
+        status_code=500,
+        content={"detail": str(exc), "type": type(exc).__name__,
+                 "trace": _tb.format_exc()},
+    )
 
 # ---------------------------------------------------------------------------
 # CORS — allow any origin so physical devices, emulators, and web clients
