@@ -14,7 +14,9 @@ from PIL import (
 )
 import numpy as np
 import io
-from rembg import remove
+from rembg import remove, new_session as _new_session
+
+_rembg_session = _new_session("u2net_cloth_seg")
 
 # --------------------------------------------------
 # App
@@ -239,7 +241,7 @@ async def style_image(file: UploadFile = File(...)):
     corrections = compute_corrections(analysis)
 
     # Remove background (intermediate)
-    foreground = remove(original)
+    foreground = remove(original, session=_rembg_session)
 
     # Canvas
     CANVAS_SIZE = (768, 768)
@@ -293,7 +295,7 @@ async def remove_background(file: UploadFile = File(...)):
     input_image = Image.open(io.BytesIO(input_bytes))
 
     # Remove background
-    output_image = remove(input_image)
+    output_image = remove(input_image, session=_rembg_session)
 
     # Convert to PNG
     output_buffer = io.BytesIO()
@@ -330,7 +332,7 @@ async def remove_bg(file: UploadFile = File(...)):
 
     # --- Remove background ---
     try:
-        output_image = remove(input_image)
+        output_image = remove(input_image, session=_rembg_session)
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Background removal failed: {e}") from e
 

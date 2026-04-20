@@ -28,7 +28,9 @@ from typing import Optional
 import numpy as np
 import requests as _requests
 from PIL import Image
-from rembg import remove
+from rembg import remove, new_session as _new_session
+
+_rembg_session = _new_session("u2net_cloth_seg")
 
 from services.clothing_classifier import classifier as _hybrid_classifier
 
@@ -398,7 +400,7 @@ async def extract_clothing_metadata(image_bytes: bytes) -> dict:
     cv_color = "unknown"
     if original_img is not None:
         try:
-            fg_img   = remove(original_img)
+            fg_img   = remove(original_img, session=_rembg_session)
             cv_color = _dominant_color_from_rgba(fg_img, original_img)
         except Exception as exc:
             log.warning("rembg/color failed: %s", exc)

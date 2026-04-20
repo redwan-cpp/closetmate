@@ -19,6 +19,13 @@ from PIL import Image
 
 from services.image_processing import remove_background_and_save
 
+try:
+    from rembg import remove as _rembg_remove, new_session as _new_session
+    _rembg_session = _new_session("u2net_cloth_seg")
+except Exception:
+    _rembg_remove = None  # type: ignore
+    _rembg_session = None  # type: ignore
+
 router = APIRouter()
 
 
@@ -72,9 +79,10 @@ async def remove_bg_endpoint(file: UploadFile = File(...)) -> dict:
     if not body:
         raise HTTPException(status_code=400, detail="Empty file")
     try:
-        from rembg import remove as rembg_remove
+        if _rembg_remove is None:
+            raise RuntimeError("rembg unavailable")
         image = Image.open(io.BytesIO(body))
-        output = rembg_remove(image)
+        output = _rembg_remove(image, session=_rembg_session)
         buf = io.BytesIO()
         output.save(buf, format="PNG")
         b64 = base64.standard_b64encode(buf.getvalue()).decode("ascii")
@@ -94,9 +102,10 @@ async def remove_background_endpoint(file: UploadFile = File(...)) -> Response:
     if not body:
         raise HTTPException(status_code=400, detail="Empty file")
     try:
-        from rembg import remove as rembg_remove
+        if _rembg_remove is None:
+            raise RuntimeError("rembg unavailable")
         image = Image.open(io.BytesIO(body))
-        output = rembg_remove(image)
+        output = _rembg_remove(image, session=_rembg_session)
         buf = io.BytesIO()
         output.save(buf, format="PNG")
         buf.seek(0)
@@ -116,17 +125,15 @@ async def style_image_endpoint(file: UploadFile = File(...)) -> Response:
     if not body:
         raise HTTPException(status_code=400, detail="Empty file")
     try:
-        from rembg import remove as rembg_remove
-        from PIL import ImageFilter, ImageEnhance
-        import numpy as np
-
+        if _rembg_remove is None:
+            raise RuntimeError("rembg unavailable")
         original = Image.open(io.BytesIO(body)).convert("RGBA")
 
         # Lighting analysis
         analysis = _analyze_lighting(original)
 
         # Remove background
-        foreground = rembg_remove(original)
+        foreground = _rembg_remove(original, session=_rembg_session)
 
         # Create editorial gradient background
         CANVAS_SIZE = (768, 768)

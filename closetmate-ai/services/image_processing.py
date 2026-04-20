@@ -19,11 +19,13 @@ print("[image_processing] Using CPU-based background removal")
 
 # Import rembg here so any model-download errors appear at startup, not mid-request
 try:
-    from rembg import remove as _rembg_remove
-    log.info("[image_processing] rembg imported successfully")
+    from rembg import remove as _rembg_remove, new_session as _new_session
+    _rembg_session = _new_session("u2net_cloth_seg")
+    log.info("[image_processing] rembg imported successfully (model: u2net_cloth_seg)")
 except Exception as _e:
     log.error("[image_processing] rembg import FAILED: %s", _e)
     _rembg_remove = None  # type: ignore
+    _rembg_session = None  # type: ignore
 
 
 def _ensure_rembg():
@@ -68,7 +70,7 @@ def remove_background_and_save(image_bytes: bytes) -> str:
         raise ValueError(f"Invalid or unsupported image: {e}") from e
 
     try:
-        output_image = _rembg_remove(input_image)  # type: ignore[misc]
+        output_image = _rembg_remove(input_image, session=_rembg_session)  # type: ignore[misc]
     except Exception as e:
         log.error("[image_processing] rembg.remove() failed: %s", e, exc_info=True)
         raise ValueError(f"Background removal failed: {e}") from e
