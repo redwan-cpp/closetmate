@@ -1,40 +1,10 @@
-import { Platform } from "react-native";
 import * as FileSystem from "expo-file-system/legacy";
 
 // ---------------------------------------------------------------------------
 // Network configuration
 // ---------------------------------------------------------------------------
 
-/**
- * Set this to your PC's local IPv4 address (e.g. "192.168.1.42") when
- * testing on a PHYSICAL Android or iOS device connected to the same Wi-Fi
- * network as your development PC.
- *
- * Leave as null to use the automatic emulator/simulator addresses below.
- *
- * Find your IP:
- *   Windows → open PowerShell → run `ipconfig` → look for "IPv4 Address"
- *   macOS   → System Settings → Wi-Fi → Details → IP Address
- */
-const PHYSICAL_DEVICE_IP: string | null = "192.168.0.188";
-
-/**
- * Resolved base URL for all AI API requests.
- *
- * Priority order:
- *  1. PHYSICAL_DEVICE_IP  → http://<ip>:8000           (physical Android OR iOS)
- *  2. Android             → http://10.0.2.2:8000        (Android emulator → host loopback)
- *  3. iOS/other           → http://127.0.0.1:8000       (iOS simulator)
- */
-export const AI_BASE_URL: string = (() => {
-  if (PHYSICAL_DEVICE_IP) {
-    return `http://${PHYSICAL_DEVICE_IP}:8000`;
-  }
-  if (Platform.OS === "android") {
-    return "http://10.0.2.2:8000";
-  }
-  return "http://127.0.0.1:8000";
-})();
+export const AI_BASE_URL = "https://closetmate-3ros.onrender.com";
 
 console.log("[ai.ts] AI_BASE_URL =", AI_BASE_URL);
 
@@ -264,12 +234,13 @@ export async function deleteWardrobeItem(itemId: string): Promise<void> {
 
 
 // ---------------------------------------------------------------------------
-// removeBackground — calls POST /remove-bg, returns a data: URI
+// removeBackground — calls POST /remove-bg, returns a data: URI (display only)
 // ---------------------------------------------------------------------------
 
 /**
  * Upload an image to the FastAPI /remove-bg endpoint and return a
  * displayable `data:image/png;base64,...` URI with the background removed.
+ * Used for on-screen preview only — NOT for saving to the wardrobe.
  *
  * @param uri  Local file URI from ImagePicker (file:// or similar)
  * @returns    Data URI string ready for use in <Image source={{ uri }} />
@@ -330,6 +301,58 @@ export async function removeBackground(uri: string): Promise<string> {
   );
 
   return `data:image/png;base64,${imageB64}`;
+}
+
+// ---------------------------------------------------------------------------
+// uploadClothing — POST /upload/upload-clothing
+// Saves image server-side and returns the server path for DB storage
+// ---------------------------------------------------------------------------
+
+export interface UploadClothingResult {
+  /** Relative server path, e.g. "uploads/processed/abc123.png" */
+  image_path: string;
+  status: string;
+}
+
+/**
+ * Upload an image to /upload/upload-clothing.
+ * The backend runs background removal and saves the result to disk.
+ * Returns the server-relative path that should be stored in the DB,
+ * so the chat endpoint can later serve the image via the /uploads static mount.
+ */
+export async function uploadClothing(uri: string): Promise<UploadClothingResult> {
+  const url = `${AI_BASE_URL}/upload/upload-clothing`;
+  console.log("[uploadClothing] Uploading to:", url);
+
+  let response: Response;
+  try {
+    response = await fetch(url, {
+      method: "POST",
+      body: buildImageFormData(uri),
+    });
+  } catch (e) {
+    const msg = e instanceof Error ? e.message : String(e);
+    console.error("[uploadClothing] Network error:", msg);
+    throw new Error(
+      `Cannot reach backend at ${url}.\n${msg}\n\n` +
+      "On a physical device, set PHYSICAL_DEVICE_IP in src/api/ai.ts to your PC's local IP."
+    );
+  }
+
+  console.log("[uploadClothing] Response status:", response.status);
+
+  if (!response.ok) {
+    const text = await response.text().catch(() => "");
+    console.error("[uploadClothing] Backend error body:", text);
+    throw new Error(
+      `Upload failed (HTTP ${response.status})` +
+      (text ? `:\n${text.slice(0, 200)}` : "")
+    );
+  }
+
+  const json = await response.json();
+  console.log("[uploadClothing] Result:", json);
+  return json as UploadClothingResult;
 }
 
 // ---------------------------------------------------------------------------
@@ -411,6 +434,8 @@ export interface ChatHistoryEntry {
 export interface SuggestedOutfitItem {
   subcategory: string;
   color: string;
+  item_id?: string | null;
+  image_url?: string | null;
 }
 
 export interface ChatResponse {
