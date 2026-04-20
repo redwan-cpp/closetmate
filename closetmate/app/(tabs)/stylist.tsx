@@ -32,6 +32,8 @@ import {
   Easing,
   useColorScheme,
   Dimensions,
+  Image,
+  ScrollView,
 } from 'react-native';
 import { SafeAreaView } from 'react-native-safe-area-context';
 import { Ionicons } from '@expo/vector-icons';
@@ -152,8 +154,39 @@ const COLOR_HEX: Record<string, string> = {
   mustard: '#F9A825', coral: '#FF7043', lavender: '#9575CD', sky_blue: '#03A9F4',
 };
 
-function OutfitItemChip({ item, isDark }: { item: SuggestedOutfitItem; isDark: boolean }) {
+function OutfitItemCard({ item, isDark }: { item: SuggestedOutfitItem; isDark: boolean }) {
   const dot = COLOR_HEX[item.color.toLowerCase().replace(' ', '_')] ?? '#AAA';
+  const [imgError, setImgError] = useState(false);
+
+  if (item.image_url && !imgError) {
+    return (
+      <View style={[styles.outfitCard, { backgroundColor: isDark ? '#2C2C2E' : '#E8E8ED' }]}>
+        <Image
+          source={{ uri: item.image_url }}
+          style={styles.outfitCardImage}
+          onError={() => setImgError(true)}
+          resizeMode="cover"
+        />
+        <View style={styles.outfitCardMeta}>
+          <View style={[styles.chipDot, { backgroundColor: dot, marginBottom: 2 }]} />
+          <Text
+            style={[styles.outfitCardLabel, { color: isDark ? '#FFF' : '#1C1C1E' }]}
+            numberOfLines={1}
+          >
+            {item.color}
+          </Text>
+          <Text
+            style={[styles.outfitCardSub, { color: isDark ? '#AEAEB2' : '#636366' }]}
+            numberOfLines={1}
+          >
+            {item.subcategory}
+          </Text>
+        </View>
+      </View>
+    );
+  }
+
+  // Fallback: color-dot chip (no image or load error)
   return (
     <View style={[styles.chip, { backgroundColor: isDark ? '#2C2C2E' : '#E8E8ED' }]}>
       <View style={[styles.chipDot, { backgroundColor: dot }]} />
@@ -212,11 +245,24 @@ function Bubble({ msg, isDark }: BubbleProps) {
             <Text style={[styles.chipLabel, { color: isDark ? '#8E8E93' : '#636366' }]}>
               Suggested outfit ✦
             </Text>
-            <View style={styles.chips}>
-              {msg.outfitItems.map((item, i) => (
-                <OutfitItemChip key={i} item={item} isDark={isDark} />
-              ))}
-            </View>
+            {/* Use horizontal scroll if any item has an image, otherwise wrap chips */}
+            {msg.outfitItems.some(i => i.image_url) ? (
+              <ScrollView
+                horizontal
+                showsHorizontalScrollIndicator={false}
+                contentContainerStyle={styles.outfitCardScroll}
+              >
+                {msg.outfitItems.map((item, i) => (
+                  <OutfitItemCard key={i} item={item} isDark={isDark} />
+                ))}
+              </ScrollView>
+            ) : (
+              <View style={styles.chips}>
+                {msg.outfitItems.map((item, i) => (
+                  <OutfitItemCard key={i} item={item} isDark={isDark} />
+                ))}
+              </View>
+            )}
           </View>
         )}
       </View>
@@ -576,7 +622,7 @@ const styles = StyleSheet.create({
     lineHeight: 22,
   },
 
-  // Outfit chips
+  // Outfit chips / cards
   chipRow: {
     marginTop: 6,
     paddingLeft: 0,
@@ -610,6 +656,38 @@ const styles = StyleSheet.create({
     fontSize: 13,
     fontWeight: '500',
     textTransform: 'capitalize',
+  },
+  // Outfit image cards
+  outfitCardScroll: {
+    flexDirection: 'row',
+    gap: 10,
+    paddingRight: 8,
+  },
+  outfitCard: {
+    width: 110,
+    borderRadius: 14,
+    overflow: 'hidden',
+  },
+  outfitCardImage: {
+    width: 110,
+    height: 130,
+    backgroundColor: '#C8C8CD',
+  },
+  outfitCardMeta: {
+    paddingHorizontal: 8,
+    paddingVertical: 6,
+    alignItems: 'center',
+  },
+  outfitCardLabel: {
+    fontSize: 11,
+    fontWeight: '600',
+    textTransform: 'capitalize',
+    marginTop: 2,
+  },
+  outfitCardSub: {
+    fontSize: 10,
+    textTransform: 'capitalize',
+    marginTop: 1,
   },
 
   // Typing dots

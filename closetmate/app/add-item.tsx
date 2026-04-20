@@ -16,7 +16,7 @@ import { SafeAreaView } from "react-native-safe-area-context";
 import * as ImagePicker from "expo-image-picker";
 import { useState, useEffect, useCallback } from "react";
 import { useLocalSearchParams, useRouter } from "expo-router";
-import { removeBackground, analyzeClothing, addWardrobeItem } from "@/src/api/ai";
+import { removeBackground, analyzeClothing, addWardrobeItem, uploadClothing, AI_BASE_URL } from "@/src/api/ai";
 import { Ionicons } from "@expo/vector-icons";
 
 // ---------------------------------------------------------------------------
@@ -40,8 +40,9 @@ export default function AddItemScreen() {
 
   // ── Image state ───────────────────────────────────────────────────────────
   const [originalUri, setOriginalUri] = useState<string | null>(null);
-  const [styledUri, setStyledUri] = useState<string | null>(null);
-  const [imagePath, setImagePath] = useState<string>("");   // backend logical path
+  const [previewUri, setPreviewUri] = useState<string | null>(null);    // displayable URI (local or data:)
+  const [serverImagePath, setServerImagePath] = useState<string>("");  // server-relative path for DB
+  const [imagePath, setImagePath] = useState<string>("");              // from analyze (analyzed/ path)
 
   // ── Loading states ────────────────────────────────────────────────────────
   const [removingBg, setRemovingBg] = useState(false);
@@ -58,36 +59,42 @@ export default function AddItemScreen() {
 
   // ── Derived ───────────────────────────────────────────────────────────────
   const loading = removingBg || analyzing;
-  const displayUri = styledUri ?? originalUri;
+  const displayUri = previewUri ?? originalUri;
   const hasImage = !!originalUri;
-  const canSave = !!styledUri && !saving;
+  // Can save once we have a server-side path (either from uploadClothing or analyze fallback)
+  const canSave = !!(serverImagePath || imagePath) && !saving;
 
   // ── Helper: analyze + remove-bg in parallel ───────────────────────────────
   const processImage = useCallback(async (uri: string) => {
     setRemovingBg(true);
     setAnalyzing(true);
-    setStyledUri(null);
+    setPreviewUri(null);
+    setServerImagePath("");
 
     // Run both calls concurrently for speed
-    const [bgResult, analyzeResult] = await Promise.allSettled([
-      removeBackground(uri),
-      analyzeClothing(uri),
+    const [uploadResult, analyzeResult] = await Promise.allSettled([
+      uploadClothing(uri),   // saves to server, returns server path
+      analyzeClothing(uri),  // extracts metadata
     ]);
 
-    // Background removal
+    // Upload / background removal
     setRemovingBg(false);
-    if (bgResult.status === "fulfilled") {
-      setStyledUri(bgResult.value);
+    if (uploadResult.status === "fulfilled") {
+      const { image_path } = uploadResult.value;
+      setServerImagePath(image_path);
+      // Build a displayable URL from the server path
+      const displayUrl = `${AI_BASE_URL}/${image_path}`;
+      setPreviewUri(displayUrl);
     } else {
-      console.error("[add-item] Background removal failed:", bgResult.reason);
-      // Non-fatal — user still sees original image; show a soft warning
+      console.error("[add-item] uploadClothing failed:", uploadResult.reason);
+      // Non-fatal — fall back to original image for preview
       Alert.alert(
         "Background removal failed",
         "The original photo will be used. You can still add the item.",
         [{ text: "OK" }]
       );
-      // Use original as fallback so save button isn't permanently disabled
-      setStyledUri(uri);
+      setPreviewUri(uri);
+      // serverImagePath stays empty; we'll fall back to analyze image_path below
     }
 
     // Analyze / autofill
@@ -104,7 +111,6 @@ export default function AddItemScreen() {
       if (suggested.formality)     setStyle(suggested.formality);
     } else {
       console.warn("[add-item] Analyze failed, manual input allowed:", analyzeResult.reason);
-      // Silent — form stays empty so user can fill manually
     }
   }, []);
 
@@ -112,7 +118,8 @@ export default function AddItemScreen() {
   useEffect(() => {
     if (params.imageUri) {
       setOriginalUri(params.imageUri);
-      setStyledUri(null);
+      setPreviewUri(null);
+      setServerImagePath("");
       processImage(params.imageUri);
     }
   }, [params.imageUri, processImage]);
@@ -138,14 +145,16 @@ export default function AddItemScreen() {
     if (!result.canceled) {
       const uri = result.assets[0].uri;
       setOriginalUri(uri);
-      setStyledUri(null);
+      setPreviewUri(null);
+      setServerImagePath("");
       processImage(uri);
     }
   };
 
   const clearPreview = () => {
     setOriginalUri(null);
-    setStyledUri(null);
+    setPreviewUri(null);
+    setServerImagePath("");
     setImagePath("");
     setCategory("");
     setSubcategory("");
@@ -162,7 +171,8 @@ export default function AddItemScreen() {
     try {
       await addWardrobeItem({
         user_id: DEMO_USER_ID,
-        image_path: styledUri || originalUri || imagePath || "",
+        // Prefer the processed server path; fall back to the analyzed path
+        image_path: serverImagePath || imagePath,
         category:     category.trim()    || "unknown",
         subcategory:  subcategory.trim() || "unknown",
         primary_color: color.trim()      || "unknown",

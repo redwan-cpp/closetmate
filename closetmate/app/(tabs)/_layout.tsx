@@ -113,8 +113,6 @@ export default function TabLayout() {
         }}
       />
 
-      {/* Hidden Routes */}
-      <Tabs.Screen name="index" options={{ href: null }} />
     </Tabs>
   );
 }
