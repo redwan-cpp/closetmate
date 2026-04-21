@@ -1,11 +1,10 @@
-import { Tabs, useRouter } from 'expo-router';
+import { Tabs } from 'expo-router';
 import React from 'react';
-import { Platform, View, TouchableOpacity, StyleSheet } from 'react-native';
+import { Platform, View, StyleSheet } from 'react-native';
 
 import { HapticTab } from '@/components/haptic-tab';
-import { IconSymbol } from '@/components/ui/icon-symbol';
 import TabBarBackground from '@/components/ui/TabBarBackground';
-import { Colors, Spacing } from '@/constants/theme';
+import { Colors } from '@/constants/theme';
 import { useColorScheme } from '@/hooks/use-color-scheme';
 import { Ionicons } from '@expo/vector-icons';
 import { FloatingCameraButton } from '@/components/FloatingCameraButton';
@@ -50,9 +49,6 @@ export default function TabLayout() {
           fontWeight: '600',
           marginTop: 2,
         },
-        tabBarItemStyle: {
-          // Adjust item spacing if needed
-        }
       }}>
 
       {/* 1. Stylist Tab */}
@@ -73,7 +69,7 @@ export default function TabLayout() {
         }}
       />
 
-      {/* 3. Floating Camera Button (Middle) - Not a real screen */}
+      {/* 3. Floating Camera Button (Middle) */}
       <Tabs.Screen
         name="add-item-placeholder"
         options={{
@@ -95,16 +91,7 @@ export default function TabLayout() {
         }}
       />
 
-      {/* 4. Explore Tab */}
-      <Tabs.Screen
-        name="explore"
-        options={{
-          title: 'Explore',
-          tabBarIcon: ({ color, focused }) => <Ionicons size={24} name={focused ? 'compass' : 'compass-outline'} color={color} />,
-        }}
-      />
-
-      {/* 5. Profile Tab */}
+      {/* 4. Profile Tab */}
       <Tabs.Screen
         name="profile"
         options={{
@@ -113,16 +100,21 @@ export default function TabLayout() {
         }}
       />
 
+      {/* Hidden — explore still exists as a file but not shown in tabs */}
+      <Tabs.Screen
+        name="explore"
+        options={{ href: null }}
+      />
+
     </Tabs>
   );
 }
 
 const styles = StyleSheet.create({
   floatingButtonContainer: {
-    top: -30, // Lift it more since it's bigger
+    top: -30,
     justifyContent: 'center',
     alignItems: 'center',
     zIndex: 10,
-    // Remove fixed width to allow it to center in the flex slot
   }
 })

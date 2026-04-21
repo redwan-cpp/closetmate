@@ -8,10 +8,9 @@
 #   POST   /wardrobe/recommend         — AI outfit recommendation
 # ─────────────────────────────────────────────────────────────────
 
-import sqlite3
 import uuid
 from datetime import datetime, timezone
-from typing import List, Optional
+from typing import Any, List, Optional
 
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel
@@ -68,7 +67,7 @@ class RecommendationRequest(BaseModel):
 @router.get("/items/{user_id}", response_model=List[WardrobeItemOut])
 def get_wardrobe_items(
     user_id: str,
-    db: sqlite3.Connection = Depends(get_db),
+    db: Any = Depends(get_db),
 ):
     """Return all wardrobe items for a given user."""
     rows = db.execute(
@@ -85,7 +84,7 @@ def get_wardrobe_items(
 @router.post("/add-item")
 def add_wardrobe_item(
     payload: AddItemPayload,
-    db: sqlite3.Connection = Depends(get_db),
+    db: Any = Depends(get_db),
 ):
     """Save a new clothing item to the user's wardrobe."""
     item_id  = str(uuid.uuid4())
@@ -123,7 +122,7 @@ def add_wardrobe_item(
 @router.delete("/item/{item_id}")
 def delete_wardrobe_item(
     item_id: str,
-    db: sqlite3.Connection = Depends(get_db),
+    db: Any = Depends(get_db),
 ):
     """Permanently delete a clothing item by ID."""
     result = db.execute(

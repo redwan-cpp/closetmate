@@ -2,13 +2,12 @@ from __future__ import annotations
 
 import uuid
 from datetime import datetime
-from typing import Optional
+from typing import Any, Optional
 
 import bcrypt
 
 from fastapi import APIRouter, Depends, HTTPException, Header, status
 from pydantic import BaseModel, EmailStr
-import sqlite3
 
 from database import get_db
 from models.user import User, UserInDB
@@ -41,7 +40,7 @@ class LoginResponse(BaseModel):
   user_id: str
 
 
-def _row_to_user_in_db(row: sqlite3.Row) -> UserInDB:
+def _row_to_user_in_db(row) -> UserInDB:
   return UserInDB(
     user_id=row["user_id"],
     name=row["name"],
@@ -65,7 +64,7 @@ def _verify_password(password: str, password_hash: str) -> bool:
 
 
 @router.post("/register", response_model=RegisterResponse, status_code=status.HTTP_201_CREATED)
-def register(payload: RegisterRequest, db: sqlite3.Connection = Depends(get_db)) -> RegisterResponse:
+def register(payload: RegisterRequest, db: Any = Depends(get_db)) -> RegisterResponse:
   # Check for duplicate email
   existing = db.execute(
     "SELECT user_id FROM users WHERE email = ?",
@@ -103,7 +102,7 @@ def register(payload: RegisterRequest, db: sqlite3.Connection = Depends(get_db))
 
 
 @router.post("/login", response_model=LoginResponse)
-def login(payload: LoginRequest, db: sqlite3.Connection = Depends(get_db)) -> LoginResponse:
+def login(payload: LoginRequest, db: Any = Depends(get_db)) -> LoginResponse:
   row = db.execute(
     "SELECT * FROM users WHERE email = ?",
     (str(payload.email).lower(),),
@@ -137,7 +136,7 @@ def _parse_token(authorization: Optional[str]) -> str:
 
 def get_current_user(
   authorization: Optional[str] = Header(default=None, alias="Authorization"),
-  db: sqlite3.Connection = Depends(get_db),
+  db: Any = Depends(get_db),
 ) -> User:
   user_id = _parse_token(authorization)
   row = db.execute(

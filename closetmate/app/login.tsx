@@ -1,7 +1,6 @@
 /**
  * app/login.tsx
- * ClosetMate — Login screen
- * Supports: Email/Password · Google (placeholder) · GitHub (placeholder)
+ * ClosetMate — Login screen (redesigned to match app theme)
  */
 import React, { useState } from 'react';
 import {
@@ -21,6 +20,7 @@ export default function LoginScreen() {
   const { signIn } = useAuth();
   const colorScheme = useColorScheme();
   const isDark = colorScheme === 'dark';
+  const c = isDark ? dark : light;
 
   const [email, setEmail]       = useState('');
   const [password, setPassword] = useState('');
@@ -46,16 +46,6 @@ export default function LoginScreen() {
     }
   };
 
-  const handleOAuth = (provider: 'google' | 'github') => {
-    Alert.alert(
-      `${provider === 'google' ? 'Google' : 'GitHub'} Sign-In`,
-      'OAuth integration requires configuring credentials in your backend. Coming soon!',
-      [{ text: 'OK' }]
-    );
-  };
-
-  const c = isDark ? dark : light;
-
   return (
     <SafeAreaView style={[styles.safe, { backgroundColor: c.bg }]}>
       <StatusBar barStyle={isDark ? 'light-content' : 'dark-content'} />
@@ -70,13 +60,9 @@ export default function LoginScreen() {
         >
           {/* ── Logo / Header ── */}
           <View style={styles.header}>
-            <LinearGradient
-              colors={['#7C3AED', '#4F46E5']}
-              start={{ x: 0, y: 0 }} end={{ x: 1, y: 1 }}
-              style={styles.logoGradient}
-            >
-              <Text style={styles.logoIcon}>✦</Text>
-            </LinearGradient>
+            <View style={[styles.logoWrap, { backgroundColor: isDark ? '#1A1A1A' : '#F0F0F0' }]}>
+              <Text style={[styles.logoText, { color: c.text }]}>✦</Text>
+            </View>
             <Text style={[styles.brand, { color: c.text }]}>ClosetMate</Text>
             <Text style={[styles.tagline, { color: c.subtext }]}>
               Your AI personal stylist
@@ -84,7 +70,7 @@ export default function LoginScreen() {
           </View>
 
           {/* ── Card ── */}
-          <View style={[styles.card, { backgroundColor: c.card, shadowColor: c.shadow }]}>
+          <View style={[styles.card, { backgroundColor: c.card, borderColor: c.border }]}>
             <Text style={[styles.cardTitle, { color: c.text }]}>Welcome back</Text>
             <Text style={[styles.cardSub, { color: c.subtext }]}>Sign in to your wardrobe</Text>
 
@@ -125,59 +111,25 @@ export default function LoginScreen() {
               </View>
             </View>
 
-            {/* Login button */}
+            {/* Sign In button */}
             <TouchableOpacity
               onPress={handleLogin}
               disabled={loading}
               activeOpacity={0.85}
-              style={styles.primaryBtn}
+              style={[styles.primaryBtn, { backgroundColor: c.text }]}
             >
-              <LinearGradient
-                colors={['#7C3AED', '#4F46E5']}
-                start={{ x: 0, y: 0 }} end={{ x: 1, y: 0 }}
-                style={styles.primaryBtnInner}
-              >
-                {loading
-                  ? <ActivityIndicator color="#FFF" />
-                  : <Text style={styles.primaryBtnText}>Sign In</Text>
-                }
-              </LinearGradient>
+              {loading
+                ? <ActivityIndicator color={c.bg} />
+                : <Text style={[styles.primaryBtnText, { color: c.bg }]}>Sign In</Text>
+              }
             </TouchableOpacity>
-
-            {/* Divider */}
-            <View style={styles.divider}>
-              <View style={[styles.dividerLine, { backgroundColor: c.border }]} />
-              <Text style={[styles.dividerText, { color: c.subtext }]}>or continue with</Text>
-              <View style={[styles.dividerLine, { backgroundColor: c.border }]} />
-            </View>
-
-            {/* OAuth buttons */}
-            <View style={styles.oauthRow}>
-              <TouchableOpacity
-                onPress={() => handleOAuth('google')}
-                style={[styles.oauthBtn, { backgroundColor: c.inputBg, borderColor: c.border }]}
-                activeOpacity={0.8}
-              >
-                <Text style={styles.oauthEmoji}>🇬</Text>
-                <Text style={[styles.oauthLabel, { color: c.text }]}>Google</Text>
-              </TouchableOpacity>
-
-              <TouchableOpacity
-                onPress={() => handleOAuth('github')}
-                style={[styles.oauthBtn, { backgroundColor: c.inputBg, borderColor: c.border }]}
-                activeOpacity={0.8}
-              >
-                <Ionicons name="logo-github" size={20} color={c.text} />
-                <Text style={[styles.oauthLabel, { color: c.text }]}>GitHub</Text>
-              </TouchableOpacity>
-            </View>
           </View>
 
           {/* ── Footer ── */}
           <View style={styles.footer}>
             <Text style={[styles.footerText, { color: c.subtext }]}>Don't have an account? </Text>
             <TouchableOpacity onPress={() => router.push('/register')} activeOpacity={0.7}>
-              <Text style={styles.footerLink}>Create one</Text>
+              <Text style={[styles.footerLink, { color: c.text }]}>Create one</Text>
             </TouchableOpacity>
           </View>
         </ScrollView>
@@ -186,41 +138,33 @@ export default function LoginScreen() {
   );
 }
 
-// ── Color tokens ─────────────────────────────
-
 const light = {
-  bg: '#F5F4FF', card: '#FFFFFF', text: '#1A1A2E', subtext: '#6B7280',
-  inputBg: '#F9FAFB', border: '#E5E7EB', icon: '#9CA3AF',
-  placeholder: '#D1D5DB', shadow: '#000',
+  bg: '#FFFFFF', card: '#F8F8F8', text: '#1A1A1A', subtext: '#666666',
+  inputBg: '#FFFFFF', border: '#E5E5E5', icon: '#999999',
+  placeholder: '#CCCCCC',
 };
 const dark = {
-  bg: '#0A0A0F', card: '#14141F', text: '#F9FAFB', subtext: '#9CA3AF',
-  inputBg: '#1E1E2E', border: '#2D2D3F', icon: '#6B7280',
-  placeholder: '#4B5563', shadow: '#7C3AED',
+  bg: '#000000', card: '#121212', text: '#FFFFFF', subtext: '#A0A0A0',
+  inputBg: '#1A1A1A', border: '#333333', icon: '#666666',
+  placeholder: '#444444',
 };
-
-// ── Styles ───────────────────────────────────
 
 const styles = StyleSheet.create({
   safe: { flex: 1 },
   flex: { flex: 1 },
   scroll: { flexGrow: 1, paddingHorizontal: 24, paddingBottom: 40 },
 
-  header: { alignItems: 'center', paddingTop: 48, paddingBottom: 32 },
-  logoGradient: {
-    width: 72, height: 72, borderRadius: 22,
-    justifyContent: 'center', alignItems: 'center', marginBottom: 16,
-    shadowColor: '#7C3AED', shadowOffset: { width: 0, height: 8 },
-    shadowOpacity: 0.4, shadowRadius: 16, elevation: 12,
+  header: { alignItems: 'center', paddingTop: 52, paddingBottom: 36 },
+  logoWrap: {
+    width: 68, height: 68, borderRadius: 20,
+    justifyContent: 'center', alignItems: 'center', marginBottom: 18,
   },
-  logoIcon: { fontSize: 32, color: '#FFF' },
-  brand: { fontSize: 28, fontWeight: '800', letterSpacing: -0.5 },
-  tagline: { fontSize: 14, marginTop: 4 },
+  logoText: { fontSize: 30, fontWeight: '800' },
+  brand: { fontSize: 28, fontWeight: '800', letterSpacing: -0.5, marginBottom: 6 },
+  tagline: { fontSize: 15 },
 
   card: {
-    borderRadius: 24, padding: 24,
-    shadowOffset: { width: 0, height: 4 },
-    shadowOpacity: 0.08, shadowRadius: 20, elevation: 6,
+    borderRadius: 20, padding: 24, borderWidth: 1, marginBottom: 28,
   },
   cardTitle: { fontSize: 22, fontWeight: '700', letterSpacing: -0.3, marginBottom: 4 },
   cardSub: { fontSize: 14, marginBottom: 24 },
@@ -229,33 +173,18 @@ const styles = StyleSheet.create({
   label: { fontSize: 13, fontWeight: '600', marginBottom: 8 },
   inputRow: {
     flexDirection: 'row', alignItems: 'center',
-    borderRadius: 14, borderWidth: 1, paddingHorizontal: 14, height: 52,
+    borderRadius: 12, borderWidth: 1, paddingHorizontal: 14, height: 52,
   },
   inputIcon: { marginRight: 10 },
   input: { flex: 1, fontSize: 15 },
   eyeBtn: { padding: 4 },
 
-  primaryBtn: { marginTop: 8, borderRadius: 14, overflow: 'hidden' },
-  primaryBtnInner: {
-    height: 52, justifyContent: 'center', alignItems: 'center',
-    shadowColor: '#7C3AED', shadowOffset: { width: 0, height: 4 },
-    shadowOpacity: 0.3, shadowRadius: 8,
+  primaryBtn: {
+    height: 52, borderRadius: 12, justifyContent: 'center', alignItems: 'center', marginTop: 8,
   },
-  primaryBtnText: { fontSize: 16, fontWeight: '700', color: '#FFF' },
+  primaryBtnText: { fontSize: 16, fontWeight: '700' },
 
-  divider: { flexDirection: 'row', alignItems: 'center', marginVertical: 20 },
-  dividerLine: { flex: 1, height: 1 },
-  dividerText: { marginHorizontal: 12, fontSize: 13 },
-
-  oauthRow: { flexDirection: 'row', gap: 12 },
-  oauthBtn: {
-    flex: 1, flexDirection: 'row', alignItems: 'center', justifyContent: 'center',
-    height: 48, borderRadius: 12, borderWidth: 1, gap: 8,
-  },
-  oauthEmoji: { fontSize: 18 },
-  oauthLabel: { fontSize: 14, fontWeight: '600' },
-
-  footer: { flexDirection: 'row', justifyContent: 'center', alignItems: 'center', marginTop: 28 },
+  footer: { flexDirection: 'row', justifyContent: 'center', alignItems: 'center' },
   footerText: { fontSize: 14 },
-  footerLink: { fontSize: 14, fontWeight: '700', color: '#7C3AED' },
+  footerLink: { fontSize: 14, fontWeight: '700' },
 });

@@ -5,6 +5,10 @@ pydantic[email]
 python-multipart
 python-dotenv
 
+# ── Database ──────────────────────────────────────────────────────────────────
+sqlalchemy
+psycopg2-binary
+
 # ── Image processing (CPU-only, Render-compatible) ────────────────────────────
 pillow
 opencv-python-headless

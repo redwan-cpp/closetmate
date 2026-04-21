@@ -1,10 +1,46 @@
 import * as FileSystem from "expo-file-system/legacy";
+import Constants from "expo-constants";
 
 // ---------------------------------------------------------------------------
-// Network configuration
+// Network configuration — auto-detect backend from Expo dev server host
+// ---------------------------------------------------------------------------
+//
+// HOW IT WORKS (plug & play, zero config):
+//   When you run `npx expo start`, Expo broadcasts its Metro bundler on your
+//   machine's local LAN IP (e.g. 192.168.1.50:8081).
+//   We grab that same IP and point it at our FastAPI backend on port 8000.
+//   This means the app auto-connects to the correct machine on ANY network
+//   without ever changing a URL.
+//
+// REQUIREMENTS:
+//   - Backend must be running on the SAME machine as `npx expo start`
+//   - Backend must be on port 8000  (uvicorn ... --port 8000)
+//
 // ---------------------------------------------------------------------------
 
-export const AI_BASE_URL = "https://closetmate-3ros.onrender.com";
+function getBackendUrl(): string {
+  // hostUri is injected by Expo's dev server, e.g. "192.168.1.50:8081"
+  const hostUri = Constants.expoConfig?.hostUri;
+
+  if (hostUri) {
+    const host = hostUri.split(":")[0]; // strip Expo's port → "192.168.1.50"
+    const url = `http://${host}:8000`;
+    console.log("[ai.ts] Auto-detected backend URL:", url);
+    return url;
+  }
+
+  // Android emulator — host machine is reachable at 10.0.2.2
+  if (__DEV__) {
+    console.warn("[ai.ts] hostUri not available, falling back to 10.0.2.2:8000 (Android emulator)");
+    return "http://10.0.2.2:8000";
+  }
+
+  // Production / standalone build fallback — update this if you ever deploy
+  console.warn("[ai.ts] Production build: using localhost fallback");
+  return "http://localhost:8000";
+}
+
+export const AI_BASE_URL = getBackendUrl();
 
 console.log("[ai.ts] AI_BASE_URL =", AI_BASE_URL);
 
