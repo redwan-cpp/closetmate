@@ -14,6 +14,7 @@ from typing import Any, List, Optional
 
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel
+from sqlalchemy import text
 
 from database import get_db
 from services.recommendation_engine import build_outfits, ai_refine_outfits, get_weather_category
@@ -71,10 +72,10 @@ def get_wardrobe_items(
 ):
     """Return all wardrobe items for a given user."""
     rows = db.execute(
-        "SELECT * FROM wardrobe_items WHERE user_id = ? ORDER BY created_at DESC",
-        (user_id,),
+        text("SELECT * FROM wardrobe_items WHERE user_id = :uid ORDER BY created_at DESC"),
+        {"uid": user_id},
     ).fetchall()
-    return [dict(r) for r in rows]
+    return [dict(r._mapping) for r in rows]
 
 
 # ─────────────────────────────────────────────
@@ -91,25 +92,26 @@ def add_wardrobe_item(
     now      = datetime.now(timezone.utc).isoformat()
 
     db.execute(
-        """
+        text("""
         INSERT INTO wardrobe_items
           (item_id, user_id, category, subcategory, primary_color,
            material, pattern, formality_level, cultural_style, image_path, created_at)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-        """,
-        (
-            item_id,
-            payload.user_id,
-            payload.category,
-            payload.subcategory,
-            payload.primary_color,
-            payload.material,
-            payload.pattern,
-            payload.formality,
-            payload.culture,
-            payload.image_path,
-            now,
-        ),
+        VALUES (:item_id, :user_id, :category, :subcategory, :primary_color,
+                :material, :pattern, :formality, :culture, :image_path, :created_at)
+        """),
+        {
+            "item_id": item_id,
+            "user_id": payload.user_id,
+            "category": payload.category,
+            "subcategory": payload.subcategory,
+            "primary_color": payload.primary_color,
+            "material": payload.material,
+            "pattern": payload.pattern,
+            "formality": payload.formality,
+            "culture": payload.culture,
+            "image_path": payload.image_path,
+            "created_at": now,
+        },
     )
     db.commit()
     return {"status": "success", "item_id": item_id}
@@ -126,7 +128,8 @@ def delete_wardrobe_item(
 ):
     """Permanently delete a clothing item by ID."""
     result = db.execute(
-        "DELETE FROM wardrobe_items WHERE item_id = ?", (item_id,)
+        text("DELETE FROM wardrobe_items WHERE item_id = :item_id"),
+        {"item_id": item_id},
     )
     db.commit()
     if result.rowcount == 0:

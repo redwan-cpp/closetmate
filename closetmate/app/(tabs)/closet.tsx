@@ -17,8 +17,17 @@ import { useFocusEffect, useRouter } from 'expo-router';
 import { Ionicons } from '@expo/vector-icons';
 import { useColorScheme } from '@/hooks/use-color-scheme';
 import { Colors, Spacing, BorderRadius } from '@/constants/theme';
-import { getWardrobeItems, deleteWardrobeItem, WardrobeItem } from '@/src/api/ai';
+import { getWardrobeItems, deleteWardrobeItem, WardrobeItem, AI_BASE_URL } from '@/src/api/ai';
 import ActionSheetModal from '@/components/ActionSheetModal';
+import { useAuth } from '@/src/context/AuthContext';
+
+/** Ensure image_path is always a full http URL, not a relative server path. */
+function resolveImageUrl(imagePath: string | null | undefined): string {
+  if (!imagePath) return '';
+  if (imagePath.startsWith('http')) return imagePath;
+  // Normalize Windows backslashes and prepend base URL
+  return `${AI_BASE_URL}/${imagePath.replace(/\\/g, '/')}`;
+}
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -28,7 +37,6 @@ const H_PAD = 20;
 const GAP = 14;
 const CARD_W = (width - H_PAD * 2 - GAP) / 2;
 const CARD_H = CARD_W * 1.35;
-const DEMO_USER_ID = 'demo_user';
 
 const CATEGORIES = [
   { key: 'top',         label: 'Tops',        icon: 'shirt-outline' as const },
@@ -72,7 +80,7 @@ interface CategoryCardProps {
 
 const CategoryCard = memo(({ label, icon, count, previewUri, isDark, onPress }: CategoryCardProps) => {
   const scale = useRef(new Animated.Value(1)).current;
-  const imgOpacity = useRef(new Animated.Value(0)).current;
+  const imgOpacity = useRef(new Animated.Value(1)).current; // start visible immediately
 
   const onPressIn = () => Animated.spring(scale, { toValue: 0.96, useNativeDriver: true, speed: 30 }).start();
   const onPressOut = () => Animated.spring(scale, { toValue: 1, useNativeDriver: true, speed: 20 }).start();
@@ -115,17 +123,18 @@ interface DetailCardProps {
 
 const DetailCard = memo(({ item, isDark, onLongPress }: DetailCardProps) => {
   const scale = useRef(new Animated.Value(1)).current;
-  const opacity = useRef(new Animated.Value(0)).current;
+  const opacity = useRef(new Animated.Value(1)).current; // start visible, no fade-in delay
 
-  const uri = item.image_path ?? '';
-  const ok = uri.startsWith('data:') || uri.startsWith('file:') || uri.startsWith('http');
+  const uri = resolveImageUrl(item.image_path);
+  const ok = uri.startsWith('http') || uri.startsWith('data:') || uri.startsWith('file:');
+  if (!ok) console.warn('[closet] DetailCard — no valid URI for item:', item.item_id, '| raw path:', item.image_path);
   const colorDot = resolveColorDot(item.primary_color);
 
   const onPressIn = () => Animated.spring(scale, { toValue: 0.96, useNativeDriver: true, speed: 30 }).start();
   const onPressOut = () => Animated.spring(scale, { toValue: 1, useNativeDriver: true, speed: 20 }).start();
 
   const handleLongPress = () => {
-    Vibration.vibrate(40); // subtle haptic pulse
+    Vibration.vibrate(40);
     onLongPress(item);
   };
 
@@ -147,7 +156,7 @@ const DetailCard = memo(({ item, isDark, onLongPress }: DetailCardProps) => {
             source={{ uri }}
             style={[styles.cardImage, { opacity }]}
             resizeMode="cover"
-            onLoad={() => Animated.timing(opacity, { toValue: 1, duration: 280, useNativeDriver: true }).start()}
+            onError={(e) => console.warn('[closet] Image load error:', uri, e.nativeEvent.error)}
           />
         ) : (
           <View style={[styles.cardPlaceholder, { backgroundColor: isDark ? '#252525' : '#F5F5F5' }]}>
@@ -180,6 +189,8 @@ export default function ClosetScreen() {
   const theme = colorScheme ?? 'light';
   const C = Colors[theme];
   const router = useRouter();
+  const { user_id } = useAuth();
+  const activeUserId = user_id ?? 'demo_user';
 
   const [items, setItems] = useState<WardrobeItem[]>([]);
   const [loading, setLoading] = useState(true);
@@ -195,12 +206,12 @@ export default function ClosetScreen() {
       let active = true;
       setLoading(true);
       setError(null);
-      getWardrobeItems(DEMO_USER_ID)
+      getWardrobeItems(activeUserId)
         .then((data) => { if (active) setItems(data); })
         .catch(() => { if (active) setError('Could not load wardrobe. Is the backend running?'); })
         .finally(() => { if (active) setLoading(false); });
       return () => { active = false; };
-    }, [])
+    }, [activeUserId])
   );
 
   // ── Long-press handler ────────────────────────────────────────────────────
@@ -264,7 +275,7 @@ export default function ClosetScreen() {
   };
   const categorySections: CategorySection[] = CATEGORIES.map((cat) => {
     const matched = items.filter((i) => (i.category ?? '').toLowerCase() === cat.key);
-    return { ...cat, count: matched.length, previewUri: matched[0]?.image_path ?? null };
+    return { ...cat, count: matched.length, previewUri: resolveImageUrl(matched[0]?.image_path) || null };
   }).filter((c) => c.count > 0);
 
   const knownKeys = new Set(CATEGORIES.map((c) => c.key));
@@ -272,7 +283,7 @@ export default function ClosetScreen() {
   if (otherItems.length > 0) {
     categorySections.push({
       key: 'other', label: 'Other', icon: 'grid-outline',
-      count: otherItems.length, previewUri: otherItems[0]?.image_path ?? null,
+      count: otherItems.length, previewUri: resolveImageUrl(otherItems[0]?.image_path) || null,
     });
   }
 

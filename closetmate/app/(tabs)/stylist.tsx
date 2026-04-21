@@ -41,10 +41,11 @@ import {
   sendChatMessage,
   ChatHistoryEntry,
   SuggestedOutfitItem,
+  AI_BASE_URL,
 } from '@/src/api/ai';
+import { useAuth } from '@/src/context/AuthContext';
 
 const { width } = Dimensions.get('window');
-const DEMO_USER_ID = 'demo_user';
 
 // ─────────────────────────────────────────────
 // Types
@@ -158,11 +159,18 @@ function OutfitItemCard({ item, isDark }: { item: SuggestedOutfitItem; isDark: b
   const dot = COLOR_HEX[item.color.toLowerCase().replace(' ', '_')] ?? '#AAA';
   const [imgError, setImgError] = useState(false);
 
-  if (item.image_url && !imgError) {
+  // Resolve relative path to full URL (backend returns relative paths for network portability)
+  const resolvedUrl = item.image_url
+    ? item.image_url.startsWith('http')
+      ? item.image_url
+      : `${AI_BASE_URL}/${item.image_url.replace(/\\/g, '/')}`
+    : null;
+
+  if (resolvedUrl && !imgError) {
     return (
       <View style={[styles.outfitCard, { backgroundColor: isDark ? '#2C2C2E' : '#E8E8ED' }]}>
-        <Image
-          source={{ uri: item.image_url }}
+      <Image
+          source={{ uri: resolvedUrl }}
           style={styles.outfitCardImage}
           onError={() => setImgError(true)}
           resizeMode="cover"
@@ -277,6 +285,8 @@ function Bubble({ msg, isDark }: BubbleProps) {
 export default function StylistScreen() {
   const colorScheme = useColorScheme();
   const isDark = colorScheme === 'dark';
+  const { user_id } = useAuth();
+  const activeUserId = user_id ?? 'demo_user';
 
   const [messages, setMessages] = useState<ChatMessage[]>([]);
   const [inputText, setInputText] = useState('');
@@ -322,7 +332,7 @@ export default function StylistScreen() {
 
       try {
         const history = buildHistory();
-        const result = await sendChatMessage(DEMO_USER_ID, trimmed, history);
+        const result = await sendChatMessage(activeUserId, trimmed, history);
 
         const aiMsg: ChatMessage = {
           id: `a-${Date.now()}`,

@@ -112,7 +112,7 @@ export default function TabLayout() {
 
 const styles = StyleSheet.create({
   floatingButtonContainer: {
-    top: -30,
+    top: -14,
     justifyContent: 'center',
     alignItems: 'center',
     zIndex: 10,

@@ -21,7 +21,7 @@ from services.image_processing import remove_background_and_save
 
 try:
     from rembg import remove as _rembg_remove, new_session as _new_session
-    _rembg_session = _new_session("u2net_cloth_seg")
+    _rembg_session = _new_session("u2net")
 except Exception:
     _rembg_remove = None  # type: ignore
     _rembg_session = None  # type: ignore

@@ -3,7 +3,7 @@
  * ClosetMate — Registration Step 2/3
  * Face scan → skin tone detection via backend
  */
-import React, { useState, useRef } from 'react';
+import React, { useState, useRef, useEffect } from 'react';
 import {
   View, Text, TouchableOpacity, StyleSheet, ActivityIndicator,
   Alert, useColorScheme, StatusBar, Dimensions, Image,
@@ -62,10 +62,10 @@ export default function RegisterFaceScreen() {
       return;
     }
     const result = await ImagePicker.launchCameraAsync({
-      cameraType: 'front' as any,
-      quality: 0.8,
-      allowsEditing: true,
-      aspect: [1, 1],
+      // Use the front-facing camera for selfies
+      cameraType: ImagePicker.CameraType.front,
+      quality: 0.85,
+      allowsEditing: false, // no forced crop — full face captures better
     });
     if (!result.canceled) {
       const uri = result.assets[0].uri;
@@ -73,6 +73,12 @@ export default function RegisterFaceScreen() {
       await runScan(uri);
     }
   };
+
+  // Auto-launch the camera when the screen first appears
+  useEffect(() => {
+    const timer = setTimeout(takeSelfie, 400); // slight delay for screen animation
+    return () => clearTimeout(timer);
+  }, []);
 
   const runScan = async (uri: string) => {
     setScanning(true);

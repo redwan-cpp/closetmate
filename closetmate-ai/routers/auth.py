@@ -8,6 +8,7 @@ import bcrypt
 
 from fastapi import APIRouter, Depends, HTTPException, Header, status
 from pydantic import BaseModel, EmailStr
+from sqlalchemy import text
 
 from database import get_db
 from models.user import User, UserInDB
@@ -49,7 +50,7 @@ def _row_to_user_in_db(row) -> UserInDB:
     body_shape=row["body_shape"],
     skin_tone=row["skin_tone"],
     style_preference=row["style_preference"],
-    created_at=datetime.fromisoformat(row["created_at"]),
+    created_at=datetime.fromisoformat(str(row["created_at"])),
     password_hash=row["password_hash"],
   )
 
@@ -67,8 +68,8 @@ def _verify_password(password: str, password_hash: str) -> bool:
 def register(payload: RegisterRequest, db: Any = Depends(get_db)) -> RegisterResponse:
   # Check for duplicate email
   existing = db.execute(
-    "SELECT user_id FROM users WHERE email = ?",
-    (str(payload.email).lower(),),
+    text("SELECT user_id FROM users WHERE email = :email"),
+    {"email": str(payload.email).lower()},
   ).fetchone()
   if existing:
     raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Email already registered")
@@ -78,23 +79,24 @@ def register(payload: RegisterRequest, db: Any = Depends(get_db)) -> RegisterRes
   password_hash = _hash_password(payload.password)
 
   db.execute(
-    """
+    text("""
     INSERT INTO users (
       user_id, name, email, password_hash, gender,
       body_shape, skin_tone, style_preference, created_at
-    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-    """,
-    (
-      user_id,
-      payload.name,
-      str(payload.email).lower(),
-      password_hash,
-      payload.gender,
-      payload.body_shape,
-      payload.skin_tone,
-      payload.style_preference,
-      created_at,
-    ),
+    ) VALUES (:user_id, :name, :email, :password_hash, :gender,
+              :body_shape, :skin_tone, :style_preference, :created_at)
+    """),
+    {
+      "user_id": user_id,
+      "name": payload.name,
+      "email": str(payload.email).lower(),
+      "password_hash": password_hash,
+      "gender": payload.gender,
+      "body_shape": payload.body_shape,
+      "skin_tone": payload.skin_tone,
+      "style_preference": payload.style_preference,
+      "created_at": created_at,
+    },
   )
   db.commit()
 
@@ -104,8 +106,8 @@ def register(payload: RegisterRequest, db: Any = Depends(get_db)) -> RegisterRes
 @router.post("/login", response_model=LoginResponse)
 def login(payload: LoginRequest, db: Any = Depends(get_db)) -> LoginResponse:
   row = db.execute(
-    "SELECT * FROM users WHERE email = ?",
-    (str(payload.email).lower(),),
+    text("SELECT * FROM users WHERE email = :email"),
+    {"email": str(payload.email).lower()},
   ).fetchone()
   if not row:
     raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid credentials")
@@ -114,7 +116,7 @@ def login(payload: LoginRequest, db: Any = Depends(get_db)) -> LoginResponse:
   if not _verify_password(payload.password, user.password_hash):
     raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid credentials")
 
-  # Simple dev token: not JWT, not persisted, encodes only user_id.
+  # Simple dev token: encodes only user_id.
   token = f"dev-{user.user_id}"
   return LoginResponse(token=token, user_id=user.user_id)
 
@@ -140,14 +142,13 @@ def get_current_user(
 ) -> User:
   user_id = _parse_token(authorization)
   row = db.execute(
-    "SELECT * FROM users WHERE user_id = ?",
-    (user_id,),
+    text("SELECT * FROM users WHERE user_id = :user_id"),
+    {"user_id": user_id},
   ).fetchone()
   if not row:
     raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="User not found")
 
   user_db = _row_to_user_in_db(row)
-  # Convert to public model (drops password_hash)
   return User(
     user_id=user_db.user_id,
     name=user_db.name,
@@ -164,8 +165,6 @@ def get_current_user(
 def profile(current_user: User = Depends(get_current_user)) -> User:
   """
   Return the currently authenticated user's public profile.
-
-  Client must send: Authorization: Bearer dev-<user_id> (from login response).
+  Client must send: Authorization: Bearer dev-<user_id>
   """
   return current_user
-

@@ -18,6 +18,7 @@ import { useState, useEffect, useCallback } from "react";
 import { useLocalSearchParams, useRouter } from "expo-router";
 import { removeBackground, analyzeClothing, addWardrobeItem, uploadClothing, AI_BASE_URL } from "@/src/api/ai";
 import { Ionicons } from "@expo/vector-icons";
+import { useAuth } from "@/src/context/AuthContext";
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -37,6 +38,8 @@ export default function AddItemScreen() {
   const router = useRouter();
   const colorScheme = useColorScheme();
   const isDark = colorScheme === "dark";
+  const { user_id } = useAuth();
+  const activeUserId = user_id ?? 'demo_user';
 
   // ── Image state ───────────────────────────────────────────────────────────
   const [originalUri, setOriginalUri] = useState<string | null>(null);
@@ -137,9 +140,8 @@ export default function AddItemScreen() {
     }
 
     const result = await ImagePicker.launchCameraAsync({
-      quality: 0.8,
-      allowsEditing: true,
-      aspect: [1, 1],
+      quality: 0.9,
+      allowsEditing: false, // Android forces fixed-ratio crop; bg removal handles full image
     });
 
     if (!result.canceled) {
@@ -170,7 +172,7 @@ export default function AddItemScreen() {
     setSaving(true);
     try {
       await addWardrobeItem({
-        user_id: DEMO_USER_ID,
+        user_id: activeUserId,
         // Prefer the processed server path; fall back to the analyzed path
         image_path: serverImagePath || imagePath,
         category:     category.trim()    || "unknown",

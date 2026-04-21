@@ -20,8 +20,10 @@ print("[image_processing] Using CPU-based background removal")
 # Import rembg here so any model-download errors appear at startup, not mid-request
 try:
     from rembg import remove as _rembg_remove, new_session as _new_session
-    _rembg_session = _new_session("u2net_cloth_seg")
-    log.info("[image_processing] rembg imported successfully (model: u2net_cloth_seg)")
+    # u2net = general-purpose background removal, works on flat-laid/hanged clothing
+    # u2net_cloth_seg only works when clothing is worn on a person → avoid it
+    _rembg_session = _new_session("u2net")
+    log.info("[image_processing] rembg imported successfully (model: u2net)")
 except Exception as _e:
     log.error("[image_processing] rembg import FAILED: %s", _e)
     _rembg_remove = None  # type: ignore
@@ -75,11 +77,27 @@ def remove_background_and_save(image_bytes: bytes) -> str:
         log.error("[image_processing] rembg.remove() failed: %s", e, exc_info=True)
         raise ValueError(f"Background removal failed: {e}") from e
 
+    # ── Always composite bg-removed result onto white ───────────────────────
+    # Whether rembg did a good or partial job, compositing onto white guarantees
+    # the saved file is always visible. Transparent areas become white.
+    import numpy as np
+    arr = np.array(output_image)
+    if arr.shape[-1] == 4:
+        transparent_ratio = (arr[:, :, 3] < 10).sum() / arr[:, :, 3].size
+        log.info("[image_processing] Transparency ratio: %.1f%%", transparent_ratio * 100)
+
+    # ── Save ───────────────────────────────────────────────────────────────
     filename = f"{uuid.uuid4().hex}.png"
     output_path = UPLOADS_PROCESSED_DIR / filename
-    output_image.save(output_path, format="PNG")
+    final = Image.new("RGB", output_image.size, (255, 255, 255))
+    if output_image.mode == "RGBA":
+        final.paste(output_image, mask=output_image.split()[3])
+    else:
+        final.paste(output_image)
+    final.save(output_path, format="PNG")
 
-    return os.path.join("uploads", "processed", filename)
+    return f"uploads/processed/{filename}"
+
 
 
 def remove_background_and_save_from_path(input_path: str) -> str:

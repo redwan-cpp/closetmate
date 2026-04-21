@@ -151,6 +151,20 @@ class _RowProxy:
     def __iter__(self):
         return iter(self._data.values())
 
+    def __len__(self):
+        return len(self._data)
+
+    @property
+    def _mapping(self):
+        """SQLAlchemy Row-compatible mapping attribute — returns the underlying dict."""
+        return self._data
+
+    def items(self):
+        return self._data.items()
+
+    def values(self):
+        return self._data.values()
+
 
 class _ConnectionWrapper:
     """
@@ -236,9 +250,16 @@ def _patch_sql(sql: str) -> str:
 _original_execute = _ConnectionWrapper.execute
 
 
-def _patched_execute(self, sql: str, params=()):
+def _patched_execute(self, sql, params=()):
+    from sqlalchemy.sql import ClauseElement
+    # Already a SQLAlchemy expression (text(), select(), etc.) — pass straight through
+    if isinstance(sql, ClauseElement):
+        named = params if isinstance(params, dict) else {}
+        result = self._conn.execute(sql, named)
+        return _ResultProxy(result)
+    # Legacy: raw SQL string with ? or %s → convert to :p0, :p1, …
     patched = _patch_sql(sql)
-    named = dict((f"p{i}", v) for i, v in enumerate(params))
+    named = {f"p{i}": v for i, v in enumerate(params)}
     result = self._conn.execute(text(patched), named)
     return _ResultProxy(result)
 

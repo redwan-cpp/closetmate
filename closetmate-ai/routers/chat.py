@@ -8,7 +8,6 @@
 import os
 import json
 import asyncio
-import sqlite3
 import logging
 import pathlib
 
@@ -16,8 +15,9 @@ from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel
 from typing import Optional, List
 from openai import AsyncOpenAI
+from sqlalchemy import text
 
-from database import DB_PATH
+from database import engine
 
 log = logging.getLogger(__name__)
 router = APIRouter()
@@ -65,30 +65,31 @@ ACCURACY RULES
 2. If the wardrobe has no suitable outfit for the occasion, say so honestly.
    Say: "I don't see a perfect match in your wardrobe for this — here's the closest option: ..."
 3. Always consider: occasion + weather + culture together. Never just one.
-4. Be specific: say "your white cotton panjabi" not just "a panjabi".
+4. Be specific: say "your white cotton shirt" not just "a shirt".
 5. If suggesting a full outfit, ALWAYS verify the combo follows the rules above before responding.
-   If you catch yourself about to pair a saree with pants — STOP and reconsider.
 
 ═══════════════════════════════════════════
-RESPONSE STYLE
+OUTFIT BLOCK RULE — THIS IS MANDATORY
 ═══════════════════════════════════════════
 
-- Warm, confident, like a stylish friend — not a robot listing items.
-- 2-4 sentences max unless the user asks for detail.
-- End with ONE specific outfit suggestion if relevant.
-- Never say "I think" or "maybe" — be confident.
-- If the user mentions a specific event (holud, wedding, eid, office, date night) — prioritize cultural appropriateness first, then style.
+EVERY TIME you mention or recommend one or more specific clothing items from the wardrobe,
+you MUST append the following JSON block at the very end of your reply — NO EXCEPTIONS:
 
-IMPORTANT — outfit block rule:
-- If the user asks for an outfit, recommendation, suggestion, or what to wear → you MUST end your reply with:
-<outfit>{"items": [{"item_id": "<EXACT item_id from wardrobe>", "subcategory": "shirt", "color": "white"}, {"item_id": "<EXACT item_id from wardrobe>", "subcategory": "jeans", "color": "navy"}]}</outfit>
-- Use the EXACT item_id, subcategory and color values from the wardrobe list below.
-- If NOT suggesting a specific outfit, reply naturally without the block.
-Always be encouraging and positive about the user's style.
+<outfit>{"items": [{"item_id": "<EXACT item_id from wardrobe>", "subcategory": "shirt", "color": "white"}, {"item_id": "<EXACT item_id from wardrobe>", "subcategory": "jeans", "color": "light blue"}]}</outfit>
+
+RULES for the outfit block:
+- Use the EXACT item_id value shown in [item_id: ...] in the wardrobe list below.
+- Include ALL items you mentioned in the text — every shirt, every pair of jeans, every accessory.
+- If the user says "not the black one" and you suggest an alternative — put the alternative in the block.
+- If you mentioned even ONE item by name, the block is required.
+- The ONLY time to omit the block is if your reply contains zero clothing references (e.g. a greeting).
+
+Response style: warm, confident, 2-4 sentences. Never say "I think" or "maybe".
 
 User's wardrobe:
 {wardrobe}
 """
+
 
 
 # ─────────────────────────────────────────────
@@ -128,8 +129,8 @@ def _wardrobe_context(rows) -> str:
     lines = []
     for r in rows:
         try:
-            # handle both dict-like sqlite3.Row and plain tuple rows
             if hasattr(r, 'keys'):
+                item_id = r["item_id"]         or ""
                 color   = r["primary_color"]   or "unknown color"
                 sub     = r["subcategory"]     or r["category"] or "item"
                 mat     = r["material"]        or ""
@@ -137,17 +138,17 @@ def _wardrobe_context(rows) -> str:
                 formal  = r["formality_level"] or ""
                 culture = r["cultural_style"]  or ""
             else:
-                # tuple fallback — column order: category, subcategory,
-                # primary_color, material, pattern, formality_level, cultural_style
-                color   = r[2] or "unknown color"
-                sub     = r[1] or r[0] or "item"
-                mat     = r[3] or ""
-                pattern = r[4] or ""
-                formal  = r[5] or ""
-                culture = r[6] or ""
+                item_id = r[0] or ""
+                color   = r[3] or "unknown color"
+                sub     = r[2] or r[1] or "item"
+                mat     = r[4] or ""
+                pattern = r[5] or ""
+                formal  = r[6] or ""
+                culture = r[7] or ""
             extras = [x for x in [mat, pattern, formal, culture]
                       if x and x.lower() not in ("", "unknown", "none")]
-            line = f"- {color} {sub}"
+            # IMPORTANT: item_id must be in the line so the AI can reference it
+            line = f"- [item_id: {item_id}] {color} {sub}"
             if extras:
                 line += f" ({', '.join(extras)})"
             lines.append(line)
@@ -276,31 +277,27 @@ async def _call_gemini(messages: list) -> Optional[str]:
 
 @router.post("/message", response_model=ChatResponse)
 async def chat_message(request: ChatRequest):
-    # Open a thread-safe connection directly — avoids the SQLite
-    # "created in thread X, used in thread Y" error that hits async handlers.
-    db = sqlite3.connect(DB_PATH, check_same_thread=False)
-    db.row_factory = sqlite3.Row
-    try:
+    with engine.connect() as db:
         return await _handle_chat(request, db)
-    finally:
-        db.close()
 
 
-async def _handle_chat(request: ChatRequest, db: sqlite3.Connection) -> ChatResponse:
-    # ── Wardrobe context ─────────────────────────────────────────────────────
-    rows = db.execute(
-        """SELECT category, subcategory, primary_color, material,
-                  pattern, formality_level, cultural_style
-           FROM wardrobe_items WHERE user_id = ?""",
-        (str(request.user_id),),
+async def _handle_chat(request: ChatRequest, db) -> ChatResponse:
+    # Single query — include item_id so _wardrobe_context can expose it to the AI
+    raw_rows = db.execute(
+        text("""SELECT item_id, category, subcategory, primary_color, material,
+                  pattern, formality_level, cultural_style, image_path
+           FROM wardrobe_items WHERE user_id = :uid"""),
+        {"uid": str(request.user_id)},
     ).fetchall()
+    # Convert to plain dicts so r["column"] works regardless of Row type
+    rows = [dict(r._mapping) for r in raw_rows]
 
-    # Separate query for image URLs — _build_image_index needs item_id + image_path
-    image_rows = db.execute(
-        "SELECT item_id, image_path FROM wardrobe_items WHERE user_id = ?",
-        (str(request.user_id),),
-    ).fetchall()
-    image_index = _build_image_index(image_rows)
+    # Build image index: item_id → relative image path
+    image_index = {
+        r["item_id"]: r["image_path"]
+        for r in rows
+        if r["item_id"] and r["image_path"]
+    }
 
     system = _SYSTEM_PROMPT.replace("{wardrobe}", _wardrobe_context(rows))
 
@@ -336,21 +333,40 @@ async def _handle_chat(request: ChatRequest, db: sqlite3.Connection) -> ChatResp
 
     reply, suggested_items = _extract_outfit(raw)
 
-    # ── Attach image URLs to suggested items ─────────────────────────────────
+    # ── Attach image paths to suggested items ────────────────────────────────
     if suggested_items:
-        base_url = os.getenv("BASE_URL", "http://localhost:8000")
+        # Build a fuzzy index: (subcategory, color) → image_path for fallback matching
+        fuzzy_index: dict = {}
+        for r in rows:
+            sub = (r.get("subcategory") or r.get("category") or "").lower().strip()
+            col = (r.get("primary_color") or "").lower().strip()
+            img = r.get("image_path")
+            if sub and img and (sub, col) not in fuzzy_index:
+                fuzzy_index[(sub, col)] = img
+
         enriched = []
         for item in suggested_items:
             image_url: Optional[str] = None
+
+            # 1. Exact item_id match
             if item.item_id and item.item_id in image_index:
                 img_path = image_index[item.item_id]
-                # img_path is stored as a relative path, e.g. "uploads/analyzed/abc.jpg"
-                # Strip any leading slash, then serve via the /uploads static mount
-                img_path = img_path.lstrip("/")
-                if img_path.startswith("uploads/"):
-                    image_url = f"{base_url}/{img_path}"
-                else:
-                    image_url = f"{base_url}/uploads/{img_path}"
+                image_url = img_path.replace("\\", "/").lstrip("/")
+
+            # 2. Fuzzy fallback: match by subcategory + color
+            if not image_url:
+                sub_key = item.subcategory.lower().strip()
+                col_key = item.color.lower().strip()
+                img_path = fuzzy_index.get((sub_key, col_key))
+                # Try just subcategory if color doesn't match exactly
+                if not img_path:
+                    img_path = next(
+                        (v for (s, c), v in fuzzy_index.items() if s == sub_key),
+                        None,
+                    )
+                if img_path:
+                    image_url = img_path.replace("\\", "/").lstrip("/")
+
             enriched.append(SuggestedItem(
                 subcategory=item.subcategory,
                 color=item.color,

@@ -83,7 +83,10 @@ export default function ProfileScreen() {
 
   // ── Fetch profile ──
   const fetchProfile = useCallback(async () => {
-    if (!token) return;
+    if (!token) {
+      setLoadingProfile(false);
+      return;
+    }
     try {
       const res = await fetch(`${AI_BASE_URL}/auth/profile`, {
         headers: { Authorization: `Bearer ${token}` },
@@ -100,7 +103,10 @@ export default function ProfileScreen() {
 
   // ── Fetch wardrobe for recent history ──
   const fetchWardrobe = useCallback(async () => {
-    if (!user_id) return;
+    if (!user_id) {
+      setLoadingWardrobe(false);
+      return;
+    }
     try {
       const res = await fetch(`${AI_BASE_URL}/wardrobe/items/${user_id}`);
       if (!res.ok) throw new Error(`HTTP ${res.status}`);

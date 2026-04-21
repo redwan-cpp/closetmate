@@ -22,8 +22,8 @@ export function FloatingCameraButton() {
 
             const result = await ImagePicker.launchCameraAsync({
                 mediaTypes: ['images'],
-                allowsEditing: true,
-                quality: 0.8,
+                allowsEditing: false,
+                quality: 0.9,
             });
 
             if (!result.canceled && result.assets && result.assets.length > 0) {
@@ -48,8 +48,8 @@ export function FloatingCameraButton() {
 
             const result = await ImagePicker.launchImageLibraryAsync({
                 mediaTypes: ['images'],
-                allowsEditing: true,
-                quality: 0.8,
+                allowsEditing: false,
+                quality: 0.9,
             });
 
             if (!result.canceled && result.assets && result.assets.length > 0) {
@@ -96,20 +96,17 @@ export function FloatingCameraButton() {
 
     return (
         <TouchableOpacity
-            activeOpacity={0.9}
+            activeOpacity={0.85}
             onPress={handlePress}
             style={[
                 styles.container,
-                {
-                    backgroundColor: '#FF6347', // Tomato Red
-                    borderColor: isDark ? '#121212' : '#FFFFFF',
-                },
+                { backgroundColor: isDark ? '#FFFFFF' : '#1A1A1A' },
             ]}
         >
             <Ionicons
-                name="camera"
-                size={40} // Increased icon size
-                color={'#FFFFFF'} // White icon on Tomato looks good
+                name="add"
+                size={26}
+                color={isDark ? '#000000' : '#FFFFFF'}
             />
         </TouchableOpacity>
     );
@@ -117,20 +114,15 @@ export function FloatingCameraButton() {
 
 const styles = StyleSheet.create({
     container: {
-        width: 76, // Bigger
-        height: 76,
-        borderRadius: 38,
+        width: 52,
+        height: 52,
+        borderRadius: 26,
         justifyContent: 'center',
         alignItems: 'center',
-        borderWidth: 4,
-        top: 0,
         shadowColor: '#000',
-        shadowOffset: {
-            width: 0,
-            height: 4,
-        },
-        shadowOpacity: 0.3,
-        shadowRadius: 4,
-        elevation: 6,
+        shadowOffset: { width: 0, height: 2 },
+        shadowOpacity: 0.18,
+        shadowRadius: 6,
+        elevation: 5,
     },
 });

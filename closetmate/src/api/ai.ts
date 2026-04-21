@@ -1,5 +1,6 @@
 import * as FileSystem from "expo-file-system/legacy";
 import Constants from "expo-constants";
+import { Platform } from "react-native";
 
 // ---------------------------------------------------------------------------
 // Network configuration — auto-detect backend from Expo dev server host
@@ -19,7 +20,18 @@ import Constants from "expo-constants";
 // ---------------------------------------------------------------------------
 
 function getBackendUrl(): string {
-  // hostUri is injected by Expo's dev server, e.g. "192.168.1.50:8081"
+  // ── Android emulator ───────────────────────────────────────────────────────
+  // The Android emulator cannot reach the host via its LAN IP (192.168.x.x).
+  // It must use the special loopback alias 10.0.2.2 which always maps to the
+  // host machine. Constants.isDevice is false when running in an emulator.
+  if (Platform.OS === 'android' && !Constants.isDevice) {
+    console.log("[ai.ts] Android emulator detected — using 10.0.2.2:8000");
+    return "http://10.0.2.2:8000";
+  }
+
+  // ── Physical device / iOS simulator ────────────────────────────────────────
+  // hostUri is injected by Expo's dev server, e.g. "192.168.1.50:8081".
+  // We grab that same IP and point it at our FastAPI backend on port 8000.
   const hostUri = Constants.expoConfig?.hostUri;
 
   if (hostUri) {
@@ -29,13 +41,13 @@ function getBackendUrl(): string {
     return url;
   }
 
-  // Android emulator — host machine is reachable at 10.0.2.2
-  if (__DEV__) {
-    console.warn("[ai.ts] hostUri not available, falling back to 10.0.2.2:8000 (Android emulator)");
-    return "http://10.0.2.2:8000";
+  // iOS simulator fallback
+  if (Platform.OS === 'ios') {
+    console.warn("[ai.ts] iOS simulator: falling back to localhost:8000");
+    return "http://localhost:8000";
   }
 
-  // Production / standalone build fallback — update this if you ever deploy
+  // Production / standalone build fallback
   console.warn("[ai.ts] Production build: using localhost fallback");
   return "http://localhost:8000";
 }
@@ -234,9 +246,18 @@ export async function getWardrobeItems(userId: string): Promise<WardrobeItem[]> 
     );
   }
 
-  const json = await response.json();
-  console.log("[getWardrobeItems] count:", (json as unknown[]).length);
-  return json as WardrobeItem[];
+  const json: WardrobeItem[] = await response.json();
+  // Resolve relative image paths to full URLs so <Image> components can load them
+  const resolved = json.map((item) => ({
+    ...item,
+    image_path: item.image_path
+      ? item.image_path.startsWith('http')
+        ? item.image_path
+        : `${AI_BASE_URL}/${item.image_path.replace(/\\/g, '/')}`
+      : null,
+  }));
+  console.log("[getWardrobeItems] count:", resolved.length);
+  return resolved;
 }
 
 // ---------------------------------------------------------------------------
