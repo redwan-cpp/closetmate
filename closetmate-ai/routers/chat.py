@@ -553,6 +553,18 @@ async def _handle_chat(request: ChatRequest, db) -> ChatResponse:
             if sub and img and (sub, col) not in fuzzy_by_subcolor:
                 fuzzy_by_subcolor[(sub, col)] = {"image_path": img, "item_id": iid}
 
+        def _resolve_image_url(img_path: str) -> str:
+            """Normalize stored image_path to a value the frontend can use.
+            - GCS / any https:// URL   → return as-is (frontend renders directly)
+            - file:// device-local path → return as-is (frontend renders directly)
+            - uploads/... relative path → return as-is (frontend will prepend AI_BASE_URL)
+            """
+            p = img_path.replace("\\", "/")
+            if p.startswith("http") or p.startswith("file://"):
+                return p  # already a usable URL
+            # Relative server path — strip any leading slash so frontend can prefix
+            return p.lstrip("/")
+
         enriched = []
         for item in suggested_items:
             image_url: Optional[str] = None
@@ -560,7 +572,8 @@ async def _handle_chat(request: ChatRequest, db) -> ChatResponse:
 
             if item.item_id and item.item_id in image_index:
                 img_path = image_index[item.item_id]
-                image_url = img_path.replace("\\", "/").lstrip("/")
+                if img_path:
+                    image_url = _resolve_image_url(img_path)
 
             if not image_url:
                 sub_key = item.subcategory.lower().strip()
@@ -573,7 +586,8 @@ async def _handle_chat(request: ChatRequest, db) -> ChatResponse:
                     )
                 if match:
                     img_path = match["image_path"]
-                    image_url = img_path.replace("\\", "/").lstrip("/")
+                    if img_path:
+                        image_url = _resolve_image_url(img_path)
                     if not resolved_item_id:
                         resolved_item_id = match.get("item_id")
 

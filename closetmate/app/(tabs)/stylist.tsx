@@ -49,8 +49,8 @@ import {
   SuggestedOutfitItem,
   WeatherContext,
   WeatherInfo,
-  AI_BASE_URL,
   logWornOutfit,
+  resolveImageUrl,
 } from '@/src/api/ai';
 import { useAuth } from '@/src/context/AuthContext';
 
@@ -202,12 +202,8 @@ function OutfitItemCard({ item, isDark }: { item: SuggestedOutfitItem; isDark: b
   const dot = COLOR_HEX[item.color.toLowerCase().replace(' ', '_')] ?? '#AAA';
   const [imgError, setImgError] = useState(false);
 
-  // Resolve relative path to full URL (backend returns relative paths for network portability)
-  const resolvedUrl = item.image_url
-    ? item.image_url.startsWith('http')
-      ? item.image_url
-      : `${AI_BASE_URL}/${item.image_url.replace(/\\/g, '/')}`
-    : null;
+  // Resolve image path — handles file://, https://, and server-relative paths
+  const resolvedUrl = resolveImageUrl(item.image_url);
 
   if (resolvedUrl && !imgError) {
     return (

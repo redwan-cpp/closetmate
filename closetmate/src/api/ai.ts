@@ -61,6 +61,24 @@ export const AI_BASE_URL = getBackendUrl();
 console.log("[ai.ts] AI_BASE_URL =", AI_BASE_URL);
 
 // ---------------------------------------------------------------------------
+// Shared image URL resolver
+// ---------------------------------------------------------------------------
+
+/**
+ * Resolves any stored image_path to a displayable URI:
+ *  - file://...            → device-local path, return as-is
+ *  - https://...           → GCS or other URL, return as-is
+ *  - uploads/...           → server-relative path, prepend AI_BASE_URL
+ */
+export function resolveImageUrl(path: string | null | undefined): string | null {
+  if (!path) return null;
+  if (path.startsWith('file://') || path.startsWith('data:')) return path;
+  if (path.startsWith('http')) return path;
+  // Server-relative path — prefix with backend base URL
+  return `${AI_BASE_URL}/${path.replace(/\\/g, '/').replace(/^\//, '')}`;
+}
+
+// ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
 
@@ -254,16 +272,7 @@ export async function getWardrobeItems(userId: string): Promise<WardrobeItem[]> 
   // Resolve relative image paths to full URLs so <Image> components can load them
   const resolved = json.map((item) => ({
     ...item,
-    image_path: (() => {
-      const p = item.image_path;
-      if (!p) return null;
-      // Persistent local file (file://) or data URI — return as-is
-      if (p.startsWith('file:') || p.startsWith('data:')) return p;
-      // Already a full cloud/http URL — return as-is
-      if (p.startsWith('http')) return p;
-      // Legacy server-relative path (e.g. "uploads/analyzed/abc.jpg") — prepend cloud base
-      return `${AI_BASE_URL}/${p.replace(/\\/g, '/')}`;
-    })(),
+    image_path: resolveImageUrl(item.image_path),
   }));
   console.log("[getWardrobeItems] count:", resolved.length);
   return resolved;
@@ -682,11 +691,7 @@ export async function getWornHistory(userId: string, limit = 7): Promise<WornLog
     ...log,
     items: log.items.map(item => ({
       ...item,
-      image_path: item.image_path
-        ? item.image_path.startsWith('http')
-          ? item.image_path
-          : `${AI_BASE_URL}/${item.image_path.replace(/\\/g, '/')}`
-        : null,
+      image_path: resolveImageUrl(item.image_path),
     })),
   }));
 }

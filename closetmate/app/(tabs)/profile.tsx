@@ -8,17 +8,15 @@ import React, { useState, useCallback } from 'react';
 import {
   StyleSheet, View, Text, ScrollView, TouchableOpacity,
   useColorScheme, ActivityIndicator, Alert, Image,
-  Dimensions,
 } from 'react-native';
 import { SafeAreaView } from 'react-native-safe-area-context';
 import { Ionicons } from '@expo/vector-icons';
 import * as ImagePicker from 'expo-image-picker';
 import { useAuth } from '@/src/context/AuthContext';
-import { AI_BASE_URL, getWornHistory, WornLog } from '@/src/api/ai';
+import { getWornHistory, WornLog } from '@/src/api/ai';
 import { useRouter } from 'expo-router';
 import { useFocusEffect } from '@react-navigation/native';
 
-const { width } = Dimensions.get('window');
 
 // ── Skin tone display map ─────────────────────
 const SKIN_TONE_MAP: Record<string, { color: string; label: string }> = {
@@ -47,9 +45,6 @@ const BODY_SHAPE_MAP: Record<string, { emoji: string; label: string; tip: string
   tall:             { emoji: '📏', label: 'Tall / Lean',        tip: 'Bold patterns, layering, statement pieces' },
   curvy:            { emoji: '🌊', label: 'Curvy / Plus',      tip: 'Wrap styles, defined waist, quality fabrics' },
 };
-
-// ── Days of week ──────────────────────────────
-const DAYS = ['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat'];
 
 interface UserProfile {
   user_id: string;
@@ -153,18 +148,18 @@ export default function ProfileScreen() {
   const skinInfo  = profile?.skin_tone  ? SKIN_TONE_MAP[profile.skin_tone]   : null;
   const shapeInfo = profile?.body_shape ? BODY_SHAPE_MAP[profile.body_shape] : null;
 
-  // Build 7 history slots from real worn logs (each slot shows the full outfit combo)
-  const historySlots = Array.from({ length: 7 }, (_, i) => {
-    const log = wornHistory[i] ?? null;
-    const imgUrls =
-      log?.items
-        .map((it) => it.image_path)
-        .filter((u): u is string => !!u) ?? [];
-    const label = log
-      ? new Date(log.worn_date + 'T00:00:00').toLocaleDateString('en-US', { month: 'short', day: 'numeric' })
-      : DAYS[i];
-    const pieceCount = log?.items.length ?? 0;
-    return { label, imgUrls, pieceCount };
+  // Build history entries from real worn logs
+  const historyEntries = wornHistory.map((log) => {
+    const imgUrls = log.items
+      .map((it) => it.image_path)
+      .filter((u): u is string => !!u);
+    const label = new Date(log.worn_date + 'T00:00:00').toLocaleDateString('en-US', {
+      month: 'short', day: 'numeric',
+    });
+    const pieceLabels = log.items
+      .map((it) => [it.primary_color, it.subcategory].filter(Boolean).join(' '))
+      .filter(Boolean);
+    return { log_id: log.log_id, label, imgUrls, pieceCount: log.items.length, pieceLabels };
   });
 
   if (loadingProfile) {
@@ -280,54 +275,54 @@ export default function ProfileScreen() {
             <EmptyState
               icon="shirt-outline"
               message="No outfits logged yet."
-              subMessage={'Tap “Wearing this today” in the AI Stylist chat to start tracking.'}
+              subMessage={'Tap "Wearing this today" in the AI Stylist chat to start tracking.'}
               c={c}
             />
           ) : (
-            <View style={styles.historyRow}>
-              {historySlots.map(({ label, imgUrls, pieceCount }, i) => (
-                <View key={i} style={styles.historyColumn}>
-                  <View style={[styles.historyCell, { backgroundColor: c.bg, borderColor: c.border }]}>
+            <ScrollView
+              horizontal
+              showsHorizontalScrollIndicator={false}
+              contentContainerStyle={styles.historyScroll}
+            >
+              {historyEntries.map(({ log_id, label, imgUrls, pieceCount, pieceLabels }) => (
+                <View key={log_id} style={[styles.historyCard, { backgroundColor: c.bg, borderColor: c.border }]}>
+                  {/* 2×2 image grid */}
+                  <View style={styles.historyGrid}>
                     {imgUrls.length === 0 ? (
-                      <Ionicons name="shirt-outline" size={16} color={c.border} />
-                    ) : imgUrls.length === 1 ? (
-                      <Image source={{ uri: imgUrls[0] }} style={styles.historyImage} resizeMode="cover" />
+                      <View style={[styles.historyGridEmpty, { backgroundColor: c.surface }]}>
+                        <Ionicons name="shirt-outline" size={28} color={c.border} />
+                      </View>
                     ) : (
-                      <View style={styles.historyComboWrap}>
-                        {imgUrls.slice(0, 4).map((uri, idx) => (
+                      [0, 1, 2, 3].map((idx) =>
+                        imgUrls[idx] ? (
                           <Image
-                            key={`${uri}-${idx}`}
-                            source={{ uri }}
-                            style={[
-                              styles.historyComboImg,
-                              {
-                                left: `${6 + idx * 16}%`,
-                                zIndex: idx + 1,
-                                borderColor: c.border,
-                              },
-                            ]}
+                            key={idx}
+                            source={{ uri: imgUrls[idx] }}
+                            style={styles.historyGridImg}
                             resizeMode="cover"
                           />
-                        ))}
-                        {imgUrls.length > 4 ? (
-                          <View style={[styles.historyMoreBadge, { borderColor: c.border, backgroundColor: c.surface }]}>
-                            <Text style={[styles.historyMoreText, { color: c.text }]}>+{imgUrls.length - 4}</Text>
-                          </View>
-                        ) : null}
-                      </View>
+                        ) : (
+                          <View key={idx} style={[styles.historyGridImg, { backgroundColor: c.surface }]} />
+                        )
+                      )
                     )}
                   </View>
-                  <Text style={[styles.historyDay, { color: c.subtext }]} numberOfLines={1}>{label}</Text>
-                  {pieceCount > 1 ? (
-                    <Text style={[styles.historyPieces, { color: c.border }]} numberOfLines={1}>
-                      {pieceCount} pcs
+                  {/* Labels */}
+                  <Text style={[styles.historyCardDate, { color: c.text }]} numberOfLines={1}>{label}</Text>
+                  <Text style={[styles.historyCardPieces, { color: c.subtext }]} numberOfLines={1}>
+                    {pieceCount} piece{pieceCount !== 1 ? 's' : ''}
+                  </Text>
+                  {pieceLabels.length > 0 && (
+                    <Text style={[styles.historyCardItems, { color: c.border }]} numberOfLines={2}>
+                      {pieceLabels.slice(0, 3).join(' · ')}
                     </Text>
-                  ) : null}
+                  )}
                 </View>
               ))}
-            </View>
+            </ScrollView>
           )}
         </View>
+
 
         {/* ── Style Insights ── */}
         <View style={[styles.card, { backgroundColor: c.surface, borderColor: c.border }]}>
@@ -394,8 +389,6 @@ const dark = {
 
 // ── Styles ────────────────────────────────────
 
-const SLOT_SIZE = (width - 24 * 2 - 6 * 8) / 7;
-
 const styles = StyleSheet.create({
   safe: { flex: 1 },
   scroll: { flex: 1 },
@@ -449,40 +442,42 @@ const styles = StyleSheet.create({
   skinLabel: { fontSize: 16, fontWeight: '700', marginBottom: 4 },
   skinSub:   { fontSize: 13 },
 
-  historyRow: { flexDirection: 'row', justifyContent: 'space-between' },
-  historyColumn: { alignItems: 'center', flex: 1, marginHorizontal: 2 },
-  historyDay:  { fontSize: 10, fontWeight: '600', marginBottom: 6 },
-  historyCell: {
-    width: SLOT_SIZE, height: SLOT_SIZE, borderRadius: 8,
-    overflow: 'hidden', justifyContent: 'center', alignItems: 'center', borderWidth: 1,
+  // ── Worn history horizontal scroll cards ──
+  historyScroll: {
+    paddingBottom: 4,
+    paddingRight: 4,
   },
-  historyImage: { width: '100%', height: '100%' },
-  historyComboWrap: {
+  historyCard: {
+    width: 120,
+    borderRadius: 14,
+    borderWidth: 1,
+    marginRight: 10,
+    padding: 8,
+    overflow: 'hidden',
+  },
+  historyGrid: {
+    width: '100%',
+    aspectRatio: 1,
+    flexDirection: 'row',
+    flexWrap: 'wrap',
+    borderRadius: 10,
+    overflow: 'hidden',
+    marginBottom: 8,
+  },
+  historyGridImg: {
+    width: '50%',
+    height: '50%',
+  },
+  historyGridEmpty: {
     width: '100%',
     height: '100%',
-    position: 'relative',
+    justifyContent: 'center',
+    alignItems: 'center',
+    borderRadius: 10,
   },
-  historyComboImg: {
-    position: 'absolute',
-    bottom: '6%',
-    width: '58%',
-    height: '82%',
-    borderRadius: 6,
-    borderWidth: 1.5,
-  },
-  historyMoreBadge: {
-    position: 'absolute',
-    right: 2,
-    bottom: 2,
-    minWidth: 18,
-    paddingHorizontal: 3,
-    paddingVertical: 1,
-    borderRadius: 4,
-    borderWidth: 1,
-    zIndex: 10,
-  },
-  historyMoreText: { fontSize: 8, fontWeight: '800' },
-  historyPieces: { fontSize: 8, fontWeight: '600', marginTop: 2 },
+  historyCardDate:   { fontSize: 12, fontWeight: '700', marginBottom: 2 },
+  historyCardPieces: { fontSize: 11, marginBottom: 2 },
+  historyCardItems:  { fontSize: 10, lineHeight: 14 },
 
   insightText: { fontSize: 14, lineHeight: 22 },
 });
