@@ -33,8 +33,13 @@ export interface LoginResult {
 }
 
 export interface SkinToneResult {
-  skin_tone: string;           // "warm" | "cool" | "neutral"
+  skin_tone: string;            // e.g. "light-medium", "medium", "deep"
+  undertone: string;            // "warm" | "cool" | "neutral"
+  display_label: string;        // e.g. "light-medium (warm)"
+  confidence: number;           // 0–1
+  hex_swatch: string;           // e.g. "#C8A882"
   recommended_colors: string[];
+  face_detected: boolean;
 }
 
 // ─────────────────────────────────────────────
@@ -43,11 +48,31 @@ export interface SkinToneResult {
 
 async function post<T>(path: string, body: object): Promise<T> {
   const url = `${AI_BASE_URL}${path}`;
-  const res = await fetch(url, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify(body),
-  });
+
+  // 20-second timeout — Cloud Run may take up to 15s to cold-start
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), 20_000);
+
+  let res: Response;
+  try {
+    res = await fetch(url, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body),
+      signal: controller.signal,
+    });
+  } catch (e: any) {
+    clearTimeout(timer);
+    if (e?.name === 'AbortError') {
+      throw new Error(
+        'The server is warming up — this can take up to 20 seconds.\nPlease tap the button again to retry.'
+      );
+    }
+    throw new Error(`Network error: ${e?.message ?? String(e)}`);
+  } finally {
+    clearTimeout(timer);
+  }
+
   if (!res.ok) {
     const text = await res.text().catch(() => '');
     let detail = `HTTP ${res.status}`;

@@ -6,50 +6,54 @@ import { Platform } from "react-native";
 // Network configuration — auto-detect backend from Expo dev server host
 // ---------------------------------------------------------------------------
 //
-// HOW IT WORKS (plug & play, zero config):
+// FOR DEVELOPMENT:
 //   When you run `npx expo start`, Expo broadcasts its Metro bundler on your
 //   machine's local LAN IP (e.g. 192.168.1.50:8081).
 //   We grab that same IP and point it at our FastAPI backend on port 8000.
-//   This means the app auto-connects to the correct machine on ANY network
-//   without ever changing a URL.
 //
-// REQUIREMENTS:
-//   - Backend must be running on the SAME machine as `npx expo start`
-//   - Backend must be on port 8000  (uvicorn ... --port 8000)
+// FOR PRODUCTION (APK builds):
+//   hostUri is null — we fall back to PRODUCTION_API_URL below.
+//   ⚠️  Set this to your deployed backend URL before building the APK!
 //
 // ---------------------------------------------------------------------------
 
+/**
+ * Production backend URL for release builds.
+ *
+ * Priority:
+ * 1) EXPO_PUBLIC_API_BASE_URL (EAS env)
+ * 2) Cloud Run default URL below
+ */
+const PRODUCTION_API_URL =
+  process.env.EXPO_PUBLIC_API_BASE_URL?.trim() ||
+  "https://closetmate-ai-801722190488.us-central1.run.app";
+
 function getBackendUrl(): string {
-  // ── Android emulator ───────────────────────────────────────────────────────
-  // The Android emulator cannot reach the host via its LAN IP (192.168.x.x).
-  // It must use the special loopback alias 10.0.2.2 which always maps to the
-  // host machine. Constants.isDevice is false when running in an emulator.
-  if (Platform.OS === 'android' && !Constants.isDevice) {
-    console.log("[ai.ts] Android emulator detected — using 10.0.2.2:8000");
-    return "http://10.0.2.2:8000";
+  // Step 1: Prefer explicit env/cloud backend in every runtime (Expo Go + APK).
+  if (PRODUCTION_API_URL) {
+    console.log("[ai.ts] Production mode — using:", PRODUCTION_API_URL);
+    return PRODUCTION_API_URL;
   }
 
-  // ── Physical device / iOS simulator ────────────────────────────────────────
-  // hostUri is injected by Expo's dev server, e.g. "192.168.1.50:8081".
-  // We grab that same IP and point it at our FastAPI backend on port 8000.
+  // Step 2: Expo dev-server host (local backend on your LAN).
+  // This works for physical Android, physical iOS, and simulators in dev mode.
   const hostUri = Constants.expoConfig?.hostUri;
-
   if (hostUri) {
-    const host = hostUri.split(":")[0]; // strip Expo's port → "192.168.1.50"
+    const host = hostUri.split(":")[0];
     const url = `http://${host}:8000`;
     console.log("[ai.ts] Auto-detected backend URL:", url);
     return url;
   }
 
-  // iOS simulator fallback
-  if (Platform.OS === 'ios') {
-    console.warn("[ai.ts] iOS simulator: falling back to localhost:8000");
-    return "http://localhost:8000";
+  // Step 3: Android emulator only (no hostUri available).
+  if (Platform.OS === 'android' && !Constants.isDevice) {
+    console.log("[ai.ts] Android emulator fallback: 10.0.2.2:8000");
+    return "http://10.0.2.2:8000";
   }
 
-  // Production / standalone build fallback
-  console.warn("[ai.ts] Production build: using localhost fallback");
-  return "http://localhost:8000";
+  // Step 4: Last resort safety.
+  console.warn("[ai.ts] Fallback path reached — using production backend URL.");
+  return "https://closetmate-ai-801722190488.us-central1.run.app";
 }
 
 export const AI_BASE_URL = getBackendUrl();
@@ -250,11 +254,16 @@ export async function getWardrobeItems(userId: string): Promise<WardrobeItem[]> 
   // Resolve relative image paths to full URLs so <Image> components can load them
   const resolved = json.map((item) => ({
     ...item,
-    image_path: item.image_path
-      ? item.image_path.startsWith('http')
-        ? item.image_path
-        : `${AI_BASE_URL}/${item.image_path.replace(/\\/g, '/')}`
-      : null,
+    image_path: (() => {
+      const p = item.image_path;
+      if (!p) return null;
+      // Persistent local file (file://) or data URI — return as-is
+      if (p.startsWith('file:') || p.startsWith('data:')) return p;
+      // Already a full cloud/http URL — return as-is
+      if (p.startsWith('http')) return p;
+      // Legacy server-relative path (e.g. "uploads/analyzed/abc.jpg") — prepend cloud base
+      return `${AI_BASE_URL}/${p.replace(/\\/g, '/')}`;
+    })(),
   }));
   console.log("[getWardrobeItems] count:", resolved.length);
   return resolved;
@@ -357,7 +366,7 @@ export async function removeBackground(uri: string): Promise<string> {
     "chars"
   );
 
-  return `data:image/png;base64,${imageB64}`;
+  return `data:image/jpeg;base64,${imageB64}`;
 }
 
 // ---------------------------------------------------------------------------
@@ -495,9 +504,77 @@ export interface SuggestedOutfitItem {
   image_url?: string | null;
 }
 
+/** Weather context that can be attached to each chat message. */
+export interface WeatherContext {
+  city?: string | null;
+  lat?: number | null;
+  lon?: number | null;
+  environment: "indoor" | "outdoor" | "both";
+}
+
+/** Weather data returned by GET /chat/weather */
+export interface WeatherInfo {
+  city: string;
+  country: string;
+  temperature: number;
+  feels_like: number;
+  humidity: number;
+  wind_speed: number;
+  condition: string;
+  condition_icon: string;
+  uv_index: number;
+  is_day: boolean;
+  environment: string;
+  context_string: string;
+  style_advisory: string;
+}
+
 export interface ChatResponse {
   reply: string;
   suggested_items: SuggestedOutfitItem[] | null;
+  weather_summary?: {
+    city: string;
+    temperature: number;
+    condition: string;
+    condition_icon: string;
+    humidity: number;
+    environment: string;
+  } | null;
+}
+
+// ---------------------------------------------------------------------------
+// fetchWeather — POST /chat/weather
+// ---------------------------------------------------------------------------
+
+/**
+ * Fetch real-time weather for a city or coordinates.
+ * Call this when the user shares their location; then pass the WeatherContext
+ * to subsequent sendChatMessage calls.
+ */
+export async function fetchWeather(
+  city?: string | null,
+  lat?: number | null,
+  lon?: number | null,
+  environment: "indoor" | "outdoor" | "both" = "outdoor"
+): Promise<WeatherInfo> {
+  const url = `${AI_BASE_URL}/chat/weather`;
+  console.log("[fetchWeather] POST", url);
+
+  const response = await fetch(url, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ city, lat, lon, environment }),
+  });
+
+  if (!response.ok) {
+    const text = await response.text().catch(() => "");
+    throw new Error(
+      `Weather fetch failed (HTTP ${response.status})` +
+        (text ? `:\n${text.slice(0, 200)}` : "")
+    );
+  }
+
+  return response.json() as Promise<WeatherInfo>;
 }
 
 // ---------------------------------------------------------------------------
@@ -506,25 +583,31 @@ export interface ChatResponse {
 
 /**
  * Send a message to the ClosetMate AI stylist.
- * The backend loads the user's wardrobe, builds context, and calls GPT-4o-mini.
+ * Optionally pass weatherContext to enable real-time weather-aware suggestions.
  */
 export async function sendChatMessage(
   userId: string,
   message: string,
-  history: ChatHistoryEntry[] = []
+  history: ChatHistoryEntry[] = [],
+  weatherContext?: WeatherContext | null
 ): Promise<ChatResponse> {
   const url = `${AI_BASE_URL}/chat/message`;
   console.log("[sendChatMessage] POST", url);
 
   const controller = new AbortController();
-  const timeout = setTimeout(() => controller.abort(), 15000); // 15s — just after backend's 12s hard kill
+  const timeout = setTimeout(() => controller.abort(), 15000);
 
   let response: Response;
   try {
     response = await fetch(url, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ user_id: userId, message, history }),
+      body: JSON.stringify({
+        user_id: userId,
+        message,
+        history,
+        weather: weatherContext ?? null,
+      }),
       signal: controller.signal,
     });
   } catch (e) {
@@ -551,3 +634,59 @@ export async function sendChatMessage(
   return json as ChatResponse;
 }
 
+
+// ---------------------------------------------------------------------------
+// logWornOutfit � POST /wardrobe/log-worn
+// ---------------------------------------------------------------------------
+
+export async function logWornOutfit(userId: string, itemIds: string[]): Promise<void> {
+  const url = `${AI_BASE_URL}/wardrobe/log-worn`;
+  const response = await fetch(url, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ user_id: userId, item_ids: itemIds }),
+  });
+  if (!response.ok) {
+    const txt = await response.text().catch(() => '');
+    throw new Error(`Log worn failed (HTTP ${response.status})${txt ? ': ' + txt.slice(0, 200) : ''}`);
+  }
+}
+
+// ---------------------------------------------------------------------------
+// getWornHistory � GET /wardrobe/worn-history/{userId}
+// ---------------------------------------------------------------------------
+
+export interface WornHistoryItem {
+  item_id: string;
+  image_path: string | null;
+  category: string | null;
+  subcategory: string | null;
+  primary_color: string | null;
+}
+
+export interface WornLog {
+  log_id: string;
+  worn_date: string;
+  items: WornHistoryItem[];
+}
+
+export async function getWornHistory(userId: string, limit = 7): Promise<WornLog[]> {
+  const url = `${AI_BASE_URL}/wardrobe/worn-history/${encodeURIComponent(userId)}?limit=${limit}`;
+  const response = await fetch(url);
+  if (!response.ok) {
+    const txt = await response.text().catch(() => '');
+    throw new Error(`Worn history failed (HTTP ${response.status})${txt ? ': ' + txt.slice(0, 200) : ''}`);
+  }
+  const logs: WornLog[] = await response.json();
+  return logs.map(log => ({
+    ...log,
+    items: log.items.map(item => ({
+      ...item,
+      image_path: item.image_path
+        ? item.image_path.startsWith('http')
+          ? item.image_path
+          : `${AI_BASE_URL}/${item.image_path.replace(/\\/g, '/')}`
+        : null,
+    })),
+  }));
+}

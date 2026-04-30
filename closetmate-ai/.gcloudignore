@@ -1,0 +1,32 @@
+# This file specifies files NOT to upload to Google Cloud Build.
+# Keeping the upload small = faster builds.
+
+.gcloudignore
+.git
+.gitignore
+
+# Python virtual environment — never needed; Docker installs from requirements.txt
+venv/
+.venv/
+env/
+
+# Python cache
+__pycache__/
+*.py[cod]
+*.pyo
+
+# Test and scratch files
+test_*.py
+*.test.py
+
+# Local uploads (built fresh in Docker)
+uploads/
+
+# IDE / OS
+.vscode/
+.idea/
+*.DS_Store
+Thumbs.db
+
+# Logs
+*.log

@@ -17,14 +17,9 @@ from fastapi import APIRouter, File, HTTPException, UploadFile
 from fastapi.responses import Response
 from PIL import Image
 
-from services.image_processing import remove_background_and_save
-
-try:
-    from rembg import remove as _rembg_remove, new_session as _new_session
-    _rembg_session = _new_session("u2net")
-except Exception:
-    _rembg_remove = None  # type: ignore
-    _rembg_session = None  # type: ignore
+# Use the shared image-processing pipeline (u2netp model, already initialised at startup).
+# This avoids loading a second 170 MB rembg model just for this router.
+from services.image_processing import _process_image_bytes as _remove_bg_bytes
 
 router = APIRouter()
 
@@ -70,7 +65,7 @@ async def analyze_lighting_endpoint(file: UploadFile = File(...)) -> dict:
 
 @router.post(
     "/remove-bg",
-    summary="Remove background and return base64-encoded PNG",
+    summary="Remove background and return base64-encoded JPEG",
 )
 async def remove_bg_endpoint(file: UploadFile = File(...)) -> dict:
     if not file.content_type or not file.content_type.startswith("image/"):
@@ -79,13 +74,10 @@ async def remove_bg_endpoint(file: UploadFile = File(...)) -> dict:
     if not body:
         raise HTTPException(status_code=400, detail="Empty file")
     try:
-        if _rembg_remove is None:
-            raise RuntimeError("rembg unavailable")
-        image = Image.open(io.BytesIO(body))
-        output = _rembg_remove(image, session=_rembg_session)
-        buf = io.BytesIO()
-        output.save(buf, format="PNG")
-        b64 = base64.standard_b64encode(buf.getvalue()).decode("ascii")
+        # _remove_bg_bytes runs rembg (u2netp) + white-background composite.
+        # Returns JPEG bytes — much smaller than PNG for the same visual quality.
+        processed = _remove_bg_bytes(body)
+        b64 = base64.standard_b64encode(processed).decode("ascii")
         return {"image": b64}
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Background removal failed: {e}") from e

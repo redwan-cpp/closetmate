@@ -25,3 +25,6 @@ httpx
 # ── Auth ──────────────────────────────────────────────────────────────────────
 passlib[bcrypt]
 bcrypt
+
+# ── Cloud Storage (production image persistence) ──────────────────────────────
+google-cloud-storage

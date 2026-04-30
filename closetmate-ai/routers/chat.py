@@ -1,6 +1,7 @@
 # routers/chat.py
 # ─────────────────────────────────────────────────────────────────
 # POST /chat/message
+# POST /chat/weather   ← NEW: fetch weather context for location
 # Primary:  OpenAI GPT-4o-mini (12 s timeout)
 # Fallback: Gemini 2.0 Flash REST (no extra SDK)
 # ─────────────────────────────────────────────────────────────────
@@ -17,7 +18,14 @@ from typing import Optional, List
 from openai import AsyncOpenAI
 from sqlalchemy import text
 
-from database import engine
+from database import get_db
+from fastapi import Depends
+from services.weather_service import (
+    get_weather_by_city,
+    get_weather_by_coords,
+    weather_to_context_string,
+    WeatherData,
+)
 
 log = logging.getLogger(__name__)
 router = APIRouter()
@@ -28,6 +36,23 @@ router = APIRouter()
 
 _SYSTEM_PROMPT = """You are ClosetMate, a warm, knowledgeable, and CULTURALLY ACCURATE personal AI stylist.
 You have access to the user's actual wardrobe items listed below.
+
+═══════════════════════════════════════════
+USER PROFILE — ALWAYS USE THIS WHEN RECOMMENDING
+═══════════════════════════════════════════
+
+{user_profile}
+
+PROFILE RULES:
+- Skin tone affects which COLORS flatter the user most. Always prioritize their recommended palette.
+- Body shape affects SILHOUETTE and FIT recommendations:
+  * hourglass    → emphasize waist, fitted clothes, wrap styles
+  * pear         → A-line skirts, wide-leg pants, statement tops, dark bottoms
+  * apple        → empire waist, flowy tops, V-necks, avoid clingy fabrics around midsection
+  * rectangle    → create curves with ruffles, peplum, belted waists, layering
+  * inverted_triangle → balance shoulders with wide-leg pants, A-line, avoid shoulder pads
+- Always mention briefly why a recommendation suits THEIR specific tone and shape.
+- If skin_tone or body_shape is unknown, ask the user to complete their profile scan.
 
 ═══════════════════════════════════════════
 ABSOLUTE OUTFIT COMBINATION RULES — NEVER BREAK THESE
@@ -55,6 +80,20 @@ CROSS-CULTURAL MIXING:
 - NEVER mix South Asian tops (kurta/panjabi) with Western bottoms (jeans/trousers).
 - NEVER mix Western tops (t-shirt/shirt) with South Asian bottoms (salwar/pajama).
 - Exception: indo-western fusion is allowed ONLY if the user explicitly asks for it.
+
+═══════════════════════════════════════════
+WEATHER & ENVIRONMENT AWARENESS
+═══════════════════════════════════════════
+
+{weather_context}
+
+WEATHER RULES:
+- If the user is going OUTDOORS: account for temperature, rain, wind, and UV when recommending fabrics and layers.
+- If the user is INDOORS: focus on comfort and style; ignore outdoor weather harshness.
+- Never suggest heavy wool/denim in extreme heat (>32°C).
+- If it's raining: avoid white/light-colored loose garments outdoors.
+- If it's very cold: recommend layering strategies.
+- Always mention the weather influence briefly in your reply so the user understands your reasoning.
 
 ═══════════════════════════════════════════
 ACCURACY RULES
@@ -90,7 +129,10 @@ User's wardrobe:
 {wardrobe}
 """
 
-
+_NO_WEATHER_CONTEXT = """No location/weather data provided yet.
+If the user mentions going somewhere or asks about weather-based suggestions,
+kindly ask: "Are you heading indoors or outdoors? Share your city or location and I'll tailor my suggestions to today's weather!"
+"""
 
 # ─────────────────────────────────────────────
 # Pydantic models
@@ -101,10 +143,19 @@ class HistoryEntry(BaseModel):
     content: str
 
 
+class WeatherContext(BaseModel):
+    """Optional weather context the client can attach to each chat message."""
+    city: Optional[str] = None
+    lat: Optional[float] = None
+    lon: Optional[float] = None
+    environment: str = "outdoor"   # "indoor" | "outdoor" | "both"
+
+
 class ChatRequest(BaseModel):
     user_id: str
     message: str
     history: Optional[List[HistoryEntry]] = []
+    weather: Optional[WeatherContext] = None
 
 
 class SuggestedItem(BaseModel):
@@ -117,7 +168,45 @@ class SuggestedItem(BaseModel):
 class ChatResponse(BaseModel):
     reply: str
     suggested_items: Optional[List[SuggestedItem]] = None
+    weather_summary: Optional[dict] = None    # ← echo back weather so frontend can display it
 
+
+# ─────────────────────────────────────────────
+# Weather endpoint models
+# ─────────────────────────────────────────────
+
+class WeatherRequest(BaseModel):
+    city: Optional[str] = None
+    lat: Optional[float] = None
+    lon: Optional[float] = None
+    environment: str = "outdoor"
+
+
+class WeatherResponse(BaseModel):
+    city: str
+    country: str
+    temperature: float
+    feels_like: float
+    humidity: int
+    wind_speed: float
+    condition: str
+    condition_icon: str
+    uv_index: float
+    is_day: bool
+    environment: str
+    context_string: str         # human-readable summary for display
+    style_advisory: str
+
+
+# ─────────────────────────────────────────────
+# Fallback profile context
+# ─────────────────────────────────────────────
+
+_NO_PROFILE_CONTEXT = (
+    "Skin Tone: unknown (user has not completed face scan)\n"
+    "Body Shape: unknown (user has not completed profile)\n"
+    "→ Suggest versatile, universally flattering styles and recommend completing the profile scan."
+)
 
 # ─────────────────────────────────────────────
 # Wardrobe → context string
@@ -147,7 +236,6 @@ def _wardrobe_context(rows) -> str:
                 culture = r[7] or ""
             extras = [x for x in [mat, pattern, formal, culture]
                       if x and x.lower() not in ("", "unknown", "none")]
-            # IMPORTANT: item_id must be in the line so the AI can reference it
             line = f"- [item_id: {item_id}] {color} {sub}"
             if extras:
                 line += f" ({', '.join(extras)})"
@@ -155,15 +243,6 @@ def _wardrobe_context(rows) -> str:
         except Exception as e:
             lines.append(f"- (item unreadable: {e})")
     return "\n".join(lines)
-
-
-def _build_image_index(rows) -> dict:
-    """Return a dict mapping item_id → image_path for quick lookup."""
-    return {
-        r["item_id"]: r["image_path"]
-        for r in rows
-        if r["item_id"] and r["image_path"]
-    }
 
 
 # ─────────────────────────────────────────────
@@ -179,7 +258,6 @@ def _extract_outfit(raw: str):
         data  = json.loads(raw[start:end].strip())
         items = []
         for i in data.get("items", []):
-            # Accept both old (no item_id) and new (with item_id) AI output
             items.append(SuggestedItem(
                 subcategory=i.get("subcategory", "item"),
                 color=i.get("color", "unknown"),
@@ -211,10 +289,30 @@ def _load_key(name: str) -> Optional[str]:
 
 
 # ─────────────────────────────────────────────
+# Weather fetch helper
+# ─────────────────────────────────────────────
+
+async def _resolve_weather(ctx: Optional[WeatherContext]) -> Optional[WeatherData]:
+    """Fetch WeatherData from the provided context asynchronously."""
+    if ctx is None:
+        return None
+    try:
+        if ctx.lat is not None and ctx.lon is not None:
+            return await asyncio.to_thread(
+                get_weather_by_coords, ctx.lat, ctx.lon, ctx.city or ""
+            )
+        elif ctx.city:
+            return await asyncio.to_thread(get_weather_by_city, ctx.city)
+    except Exception as exc:
+        log.warning("Weather fetch error: %s", exc)
+    return None
+
+
+# ─────────────────────────────────────────────
 # OpenAI call
 # ─────────────────────────────────────────────
 
-_TIMEOUT = 12.0   # reduced from 25 s → faster failure & Gemini kicks in sooner
+_TIMEOUT = 12.0
 
 
 async def _call_openai(messages: list, api_key: str) -> str:
@@ -222,7 +320,7 @@ async def _call_openai(messages: list, api_key: str) -> str:
     resp = await client.chat.completions.create(
         model="gpt-4o-mini",
         messages=messages,
-        max_tokens=250,
+        max_tokens=350,
         temperature=0.5,
     )
     return resp.choices[0].message.content.strip()
@@ -241,7 +339,6 @@ async def _call_gemini(messages: list) -> Optional[str]:
         log.warning("GEMINI_API_KEY not set — no fallback available")
         return None
 
-    # Convert OpenAI message format → Gemini contents list
     contents = []
     for msg in messages:
         if msg["role"] == "system":
@@ -254,7 +351,7 @@ async def _call_gemini(messages: list) -> Optional[str]:
 
     payload = {
         "contents": contents,
-        "generationConfig": {"temperature": 0.5, "maxOutputTokens": 250},
+        "generationConfig": {"temperature": 0.5, "maxOutputTokens": 350},
     }
     url = "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent"
     try:
@@ -272,34 +369,144 @@ async def _call_gemini(messages: list) -> Optional[str]:
 
 
 # ─────────────────────────────────────────────
-# Endpoint
+# Weather endpoint
+# ─────────────────────────────────────────────
+
+@router.post("/weather", response_model=WeatherResponse)
+async def get_weather(request: WeatherRequest):
+    """
+    Fetch real-time weather for a location and return it formatted for ClosetMate.
+    The frontend calls this when the user shares their location, then passes
+    the result back in subsequent chat messages.
+    """
+    ctx = WeatherContext(
+        city=request.city,
+        lat=request.lat,
+        lon=request.lon,
+        environment=request.environment,
+    )
+    weather = await _resolve_weather(ctx)
+    if weather is None:
+        raise HTTPException(
+            status_code=404,
+            detail="Could not fetch weather. Check the city name or coordinates.",
+        )
+
+    ctx_str = weather_to_context_string(weather, request.environment)
+
+    # Extract the advisory line
+    advisory_line = ""
+    for line in ctx_str.splitlines():
+        if "Style Advisories:" in line:
+            advisory_line = line.replace("⚠️ Style Advisories: ", "").strip()
+            break
+
+    return WeatherResponse(
+        city=weather.city,
+        country=weather.country,
+        temperature=weather.temperature,
+        feels_like=weather.feels_like,
+        humidity=weather.humidity,
+        wind_speed=weather.wind_speed,
+        condition=weather.condition,
+        condition_icon=weather.condition_icon,
+        uv_index=weather.uv_index,
+        is_day=weather.is_day,
+        environment=request.environment,
+        context_string=ctx_str,
+        style_advisory=advisory_line,
+    )
+
+
+# ─────────────────────────────────────────────
+# Chat endpoint
 # ─────────────────────────────────────────────
 
 @router.post("/message", response_model=ChatResponse)
-async def chat_message(request: ChatRequest):
-    with engine.connect() as db:
-        return await _handle_chat(request, db)
+async def chat_message(request: ChatRequest, db=Depends(get_db)):
+    return await _handle_chat(request, db)
 
 
 async def _handle_chat(request: ChatRequest, db) -> ChatResponse:
-    # Single query — include item_id so _wardrobe_context can expose it to the AI
+    # Fetch wardrobe
     raw_rows = db.execute(
         text("""SELECT item_id, category, subcategory, primary_color, material,
                   pattern, formality_level, cultural_style, image_path
            FROM wardrobe_items WHERE user_id = :uid"""),
         {"uid": str(request.user_id)},
     ).fetchall()
-    # Convert to plain dicts so r["column"] works regardless of Row type
     rows = [dict(r._mapping) for r in raw_rows]
 
-    # Build image index: item_id → relative image path
     image_index = {
         r["item_id"]: r["image_path"]
         for r in rows
         if r["item_id"] and r["image_path"]
     }
 
-    system = _SYSTEM_PROMPT.replace("{wardrobe}", _wardrobe_context(rows))
+    # ── User profile (skin tone + body shape) ────────────────────────────────
+    user_profile_str = _NO_PROFILE_CONTEXT
+    try:
+        profile_row = db.execute(
+            text("SELECT skin_tone, body_shape, gender FROM users WHERE user_id = :uid"),
+            {"uid": str(request.user_id)},
+        ).fetchone()
+        if profile_row:
+            profile = dict(profile_row._mapping)
+            skin   = profile.get("skin_tone") or "unknown"
+            body   = profile.get("body_shape") or "unknown"
+            gender = profile.get("gender") or "unknown"
+
+            # Parse out undertone if stored as "light (warm)" format
+            undertone = "unknown"
+            skin_band = skin
+            if "(" in skin and ")" in skin:
+                skin_band = skin.split("(")[0].strip()
+                undertone = skin.split("(")[1].replace(")", "").strip()
+
+            from services.skin_tone_detector import _TONE_COLORS
+            rec_colors = (
+                _TONE_COLORS.get(skin_band, {}).get(undertone)
+                or _TONE_COLORS.get(skin_band, {}).get("neutral")
+                or []
+            )
+            color_list = ", ".join(rec_colors[:6]) if rec_colors else "versatile palette"
+
+            user_profile_str = (
+                f"👤 Gender: {gender}\n"
+                f"🎨 Skin Tone: {skin_band} with {undertone} undertone\n"
+                f"✨ Best Colors for This Tone: {color_list}\n"
+                f"📐 Body Shape: {body}"
+            )
+    except Exception as exc:
+        log.warning("Could not fetch user profile: %s", exc)
+
+    # ── Weather context ───────────────────────────────────────────────────────
+    weather_data: Optional[WeatherData] = None
+    weather_summary: Optional[dict] = None
+
+    if request.weather:
+        weather_data = await _resolve_weather(request.weather)
+        if weather_data:
+            weather_summary = {
+                "city":          weather_data.city,
+                "temperature":   weather_data.temperature,
+                "condition":     weather_data.condition,
+                "condition_icon": weather_data.condition_icon,
+                "humidity":      weather_data.humidity,
+                "environment":   request.weather.environment,
+            }
+
+    if weather_data:
+        weather_ctx_str = weather_to_context_string(weather_data, request.weather.environment)
+    else:
+        weather_ctx_str = _NO_WEATHER_CONTEXT
+
+    system = (
+        _SYSTEM_PROMPT
+        .replace("{user_profile}", user_profile_str)
+        .replace("{wardrobe}", _wardrobe_context(rows))
+        .replace("{weather_context}", weather_ctx_str)
+    )
 
     messages: list = [{"role": "system", "content": system}]
     for turn in (request.history or [])[-6:]:
@@ -308,7 +515,7 @@ async def _handle_chat(request: ChatRequest, db) -> ChatResponse:
 
     raw: Optional[str] = None
 
-    # ── Primary: OpenAI ──────────────────────────────────────────────────────
+    # ── Primary: OpenAI ───────────────────────────────────────────────────────
     openai_key = _load_key("OPENAI_API_KEY")
     if openai_key:
         try:
@@ -321,7 +528,7 @@ async def _handle_chat(request: ChatRequest, db) -> ChatResponse:
     else:
         log.warning("OPENAI_API_KEY not configured — trying Gemini directly")
 
-    # ── Fallback: Gemini ─────────────────────────────────────────────────────
+    # ── Fallback: Gemini ──────────────────────────────────────────────────────
     if raw is None:
         raw = await _call_gemini(messages)
 
@@ -333,47 +540,54 @@ async def _handle_chat(request: ChatRequest, db) -> ChatResponse:
 
     reply, suggested_items = _extract_outfit(raw)
 
-    # ── Attach image paths to suggested items ────────────────────────────────
+    # ── Attach image paths to suggested items ─────────────────────────────────
     if suggested_items:
-        # Build a fuzzy index: (subcategory, color) → image_path for fallback matching
-        fuzzy_index: dict = {}
+        # Fuzzy match by (subcategory, color) → image + item_id (same wardrobe row).
+        # LLMs often omit or corrupt item_id; without id, "log worn" cannot POST to /wardrobe/log-worn.
+        fuzzy_by_subcolor: dict = {}
         for r in rows:
             sub = (r.get("subcategory") or r.get("category") or "").lower().strip()
             col = (r.get("primary_color") or "").lower().strip()
             img = r.get("image_path")
-            if sub and img and (sub, col) not in fuzzy_index:
-                fuzzy_index[(sub, col)] = img
+            iid = r.get("item_id")
+            if sub and img and (sub, col) not in fuzzy_by_subcolor:
+                fuzzy_by_subcolor[(sub, col)] = {"image_path": img, "item_id": iid}
 
         enriched = []
         for item in suggested_items:
             image_url: Optional[str] = None
+            resolved_item_id: Optional[str] = item.item_id
 
-            # 1. Exact item_id match
             if item.item_id and item.item_id in image_index:
                 img_path = image_index[item.item_id]
                 image_url = img_path.replace("\\", "/").lstrip("/")
 
-            # 2. Fuzzy fallback: match by subcategory + color
             if not image_url:
                 sub_key = item.subcategory.lower().strip()
                 col_key = item.color.lower().strip()
-                img_path = fuzzy_index.get((sub_key, col_key))
-                # Try just subcategory if color doesn't match exactly
-                if not img_path:
-                    img_path = next(
-                        (v for (s, c), v in fuzzy_index.items() if s == sub_key),
+                match = fuzzy_by_subcolor.get((sub_key, col_key))
+                if not match:
+                    match = next(
+                        (v for (s, c), v in fuzzy_by_subcolor.items() if s == sub_key),
                         None,
                     )
-                if img_path:
+                if match:
+                    img_path = match["image_path"]
                     image_url = img_path.replace("\\", "/").lstrip("/")
+                    if not resolved_item_id:
+                        resolved_item_id = match.get("item_id")
 
             enriched.append(SuggestedItem(
                 subcategory=item.subcategory,
                 color=item.color,
-                item_id=item.item_id,
+                item_id=resolved_item_id,
                 image_url=image_url,
             ))
         suggested_items = enriched
 
     log.info("Reply len=%d outfit_items=%d", len(reply), len(suggested_items or []))
-    return ChatResponse(reply=reply, suggested_items=suggested_items)
+    return ChatResponse(
+        reply=reply,
+        suggested_items=suggested_items,
+        weather_summary=weather_summary,
+    )

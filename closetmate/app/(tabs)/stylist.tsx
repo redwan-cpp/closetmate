@@ -8,6 +8,7 @@
  *  · Outfit suggestion cards rendered inline
  *  · Quick-prompt chips on first load
  *  · Proper keyboard avoidance
+ *  · Weather-aware suggestions with location input
  *  · Error bubbles when backend is unreachable
  * ─────────────────────────────────────────────
  */
@@ -34,14 +35,22 @@ import {
   Dimensions,
   Image,
   ScrollView,
+  Keyboard,
+  Modal,
+  Alert,
 } from 'react-native';
-import { SafeAreaView } from 'react-native-safe-area-context';
+import { SafeAreaView, useSafeAreaInsets } from 'react-native-safe-area-context';
 import { Ionicons } from '@expo/vector-icons';
+import * as Location from 'expo-location';
 import {
   sendChatMessage,
+  fetchWeather,
   ChatHistoryEntry,
   SuggestedOutfitItem,
+  WeatherContext,
+  WeatherInfo,
   AI_BASE_URL,
+  logWornOutfit,
 } from '@/src/api/ai';
 import { useAuth } from '@/src/context/AuthContext';
 
@@ -61,6 +70,8 @@ interface ChatMessage {
   timestamp: Date;
 }
 
+type Environment = 'indoor' | 'outdoor' | 'both';
+
 // ─────────────────────────────────────────────
 // Quick prompt chips (shown before first message)
 // ─────────────────────────────────────────────
@@ -75,6 +86,38 @@ const QUICK_PROMPTS = [
   'Suggest something casual',
   'Outfit for the office',
 ];
+
+// ─────────────────────────────────────────────
+// Animated message entry wrapper
+// ─────────────────────────────────────────────
+
+function AnimatedMessage({ children }: { children: React.ReactNode }) {
+  const opacity = useRef(new Animated.Value(0)).current;
+  const translateY = useRef(new Animated.Value(10)).current;
+
+  useEffect(() => {
+    Animated.parallel([
+      Animated.timing(opacity, {
+        toValue: 1,
+        duration: 220,
+        easing: Easing.out(Easing.ease),
+        useNativeDriver: true,
+      }),
+      Animated.spring(translateY, {
+        toValue: 0,
+        tension: 90,
+        friction: 10,
+        useNativeDriver: true,
+      }),
+    ]).start();
+  }, []);
+
+  return (
+    <Animated.View style={{ opacity, transform: [{ translateY }] }}>
+      {children}
+    </Animated.View>
+  );
+}
 
 
 function TypingIndicator({ isDark }: { isDark: boolean }) {
@@ -212,9 +255,11 @@ function OutfitItemCard({ item, isDark }: { item: SuggestedOutfitItem; isDark: b
 interface BubbleProps {
   msg: ChatMessage;
   isDark: boolean;
+  wornToday: boolean;
+  onWearToday: () => void;
 }
 
-function Bubble({ msg, isDark }: BubbleProps) {
+function Bubble({ msg, isDark, wornToday, onWearToday }: BubbleProps) {
   if (msg.role === 'user') {
     return (
       <View style={styles.userRow}>
@@ -271,6 +316,23 @@ function Bubble({ msg, isDark }: BubbleProps) {
                 ))}
               </View>
             )}
+            {/* Wear today button */}
+            <TouchableOpacity
+              style={[
+                styles.wearButton,
+                wornToday && styles.wearButtonDone,
+                { borderColor: wornToday ? '#30D158' : isDark ? '#3A3A3C' : '#D1D1D6' },
+              ]}
+              onPress={wornToday ? undefined : onWearToday}
+              activeOpacity={wornToday ? 1 : 0.7}
+            >
+              <Text style={[
+                styles.wearButtonText,
+                { color: wornToday ? '#30D158' : isDark ? '#FFF' : '#1C1C1E' },
+              ]}>
+                {wornToday ? '✓ Logged as worn today' : '👕 Wearing this today'}
+              </Text>
+            </TouchableOpacity>
           </View>
         )}
       </View>
@@ -282,18 +344,36 @@ function Bubble({ msg, isDark }: BubbleProps) {
 // Main screen
 // ─────────────────────────────────────────────
 
+// iOS tab bar height (must match _layout.tsx)
+const TAB_BAR_HEIGHT_IOS = 85;
+
 export default function StylistScreen() {
   const colorScheme = useColorScheme();
   const isDark = colorScheme === 'dark';
+  const insets = useSafeAreaInsets();
   const { user_id } = useAuth();
   const activeUserId = user_id ?? 'demo_user';
+
+  const iosTabBarOffset = Platform.OS === 'ios' ? TAB_BAR_HEIGHT_IOS - insets.bottom : 0;
 
   const [messages, setMessages] = useState<ChatMessage[]>([]);
   const [inputText, setInputText] = useState('');
   const [isThinking, setIsThinking] = useState(false);
 
+  // ── GPS Location + Weather state ────────────────────────────────────────
+  const [weatherInfo, setWeatherInfo]       = useState<WeatherInfo | null>(null);
+  const [weatherCtx, setWeatherCtx]         = useState<WeatherContext | null>(null);
+  const [showEnvModal, setShowEnvModal]     = useState(false);
+  const [environment, setEnvironment]       = useState<Environment>('outdoor');
+  const [locationLoading, setLocationLoading] = useState(false);
+  const [locationError, setLocationError]   = useState<string | null>(null);
+  const [pendingCoords, setPendingCoords]   = useState<{ lat: number; lon: number } | null>(null);
+  const [cityInput, setCityInput]           = useState('');
+  const [keyboardShown, setKeyboardShown]   = useState(false);
+
   const flatRef = useRef<FlatList>(null);
   const inputRef = useRef<TextInput>(null);
+  const prevMsgCount = useRef(0);
 
   // Build history from messages for backend context
   const buildHistory = useCallback((): ChatHistoryEntry[] => {
@@ -306,11 +386,59 @@ export default function StylistScreen() {
       }));
   }, [messages]);
 
-  const scrollToBottom = useCallback(() => {
+  const scrollToBottom = useCallback((animated = true) => {
     setTimeout(() => {
-      flatRef.current?.scrollToEnd({ animated: true });
-    }, 80);
+      flatRef.current?.scrollToEnd({ animated });
+    }, 60);
   }, []);
+
+  // Track keyboard visibility for iOS bottom padding
+  useEffect(() => {
+    const show = Keyboard.addListener('keyboardDidShow', () => setKeyboardShown(true));
+    const hide = Keyboard.addListener('keyboardDidHide', () => setKeyboardShown(false));
+    return () => { show.remove(); hide.remove(); };
+  }, []);
+
+  // ── Auto-detect GPS on mount ─────────────────────────────────────────────
+  useEffect(() => {
+    (async () => {
+      try {
+        const { status } = await Location.requestForegroundPermissionsAsync();
+        if (status !== 'granted') return;
+        const loc = await Location.getCurrentPositionAsync({ accuracy: Location.Accuracy.Balanced });
+        setPendingCoords({ lat: loc.coords.latitude, lon: loc.coords.longitude });
+        // Show environment popup once we have coordinates
+        setShowEnvModal(true);
+      } catch (e) {
+        console.warn('[stylist] GPS error:', e);
+      }
+    })();
+  }, []);
+
+  // ── Fetch weather using GPS coords + chosen environment ─────────────────
+  const handleConfirmEnvironment = useCallback(async (env: Environment) => {
+    setEnvironment(env);
+    setShowEnvModal(false);
+    const city = cityInput.trim();
+    const hasCity = city.length > 0;
+    const hasCoords = !!pendingCoords;
+    if (!hasCity && !hasCoords) return;
+    setLocationLoading(true);
+    setLocationError(null);
+    try {
+      // Prefer city name if typed, else use GPS coords
+      const info = hasCity
+        ? await fetchWeather(city, null, null, env)
+        : await fetchWeather(null, pendingCoords!.lat, pendingCoords!.lon, env);
+      setWeatherInfo(info);
+      setWeatherCtx(hasCity ? { city, environment: env } : { lat: pendingCoords!.lat, lon: pendingCoords!.lon, environment: env });
+      setCityInput('');
+    } catch (e) {
+      setLocationError(e instanceof Error ? e.message : 'Weather fetch failed. Check the city name.');
+    } finally {
+      setLocationLoading(false);
+    }
+  }, [pendingCoords, cityInput]);
 
   const sendMessage = useCallback(
     async (text: string) => {
@@ -328,11 +456,10 @@ export default function StylistScreen() {
       };
 
       setMessages(prev => [...prev, userMsg]);
-      scrollToBottom();
 
       try {
         const history = buildHistory();
-        const result = await sendChatMessage(activeUserId, trimmed, history);
+        const result = await sendChatMessage(activeUserId, trimmed, history, weatherCtx);
 
         const aiMsg: ChatMessage = {
           id: `a-${Date.now()}`,
@@ -353,15 +480,41 @@ export default function StylistScreen() {
         setMessages(prev => [...prev, errMsg]);
       } finally {
         setIsThinking(false);
-        scrollToBottom();
       }
     },
-    [isThinking, buildHistory, scrollToBottom]
+    [isThinking, buildHistory, weatherCtx]
   );
 
   const handleSend = useCallback(() => sendMessage(inputText), [inputText, sendMessage]);
 
+  // Auto-scroll when new messages arrive
+  useEffect(() => {
+    if (messages.length > prevMsgCount.current) {
+      scrollToBottom();
+    }
+    prevMsgCount.current = messages.length;
+  }, [messages.length, scrollToBottom]);
 
+  // Track which AI messages have been logged as worn (msgId → true)
+  const [wornTodayMap, setWornTodayMap] = useState<Record<string, boolean>>({});
+
+  const handleWearToday = useCallback(async (msgId: string, items: SuggestedOutfitItem[]) => {
+    const validIds = items.map(i => i.item_id).filter((id): id is string => !!id);
+    if (!validIds.length) {
+      Alert.alert(
+        'Cannot log outfit',
+        'This suggestion is missing wardrobe item IDs. Ask the stylist for an outfit again, or tap a suggestion that shows your items.'
+      );
+      return;
+    }
+    try {
+      await logWornOutfit(activeUserId, validIds);
+      setWornTodayMap(prev => ({ ...prev, [msgId]: true }));
+    } catch (e) {
+      console.warn('[stylist] logWornOutfit failed:', e);
+      Alert.alert('Could not save', e instanceof Error ? e.message : String(e));
+    }
+  }, [activeUserId]);
 
   const isEmpty = messages.length === 0 && !isThinking;
 
@@ -382,8 +535,41 @@ export default function StylistScreen() {
               Powered by your wardrobe
             </Text>
           </View>
-          <View style={[styles.statusDot, { backgroundColor: '#30D158' }]} />
+          <View style={{ flexDirection: 'row', alignItems: 'center', gap: 10 }}>
+            {/* Weather / location button */}
+            <TouchableOpacity
+              style={[
+                styles.weatherBtn,
+                { backgroundColor: weatherInfo ? '#0A84FF' : isDark ? '#2C2C2E' : '#F0F0F5' },
+              ]}
+              onPress={() => setShowEnvModal(true)}
+              activeOpacity={0.75}
+            >
+              <Text style={{ fontSize: weatherInfo ? 15 : 11, color: weatherInfo ? undefined : isDark ? '#AEAEB2' : '#6C6C70', fontWeight: weatherInfo ? '400' : '600', letterSpacing: weatherInfo ? 0 : 0.3 }}>
+                {weatherInfo ? weatherInfo.condition_icon : 'Venue'}
+              </Text>
+              {weatherInfo && (
+                <Text style={styles.weatherBtnTemp}>{weatherInfo.temperature.toFixed(0)}°</Text>
+              )}
+            </TouchableOpacity>
+            <View style={[styles.statusDot, { backgroundColor: '#30D158' }]} />
+          </View>
         </View>
+
+        {/* ── Weather banner strip (when weather loaded) ── */}
+        {weatherInfo && (
+          <View style={[styles.weatherBanner, { backgroundColor: isDark ? '#0A2540' : '#E8F4FF' }]}>
+            <Text style={[styles.weatherBannerText, { color: isDark ? '#60C0FF' : '#0059B3' }]}>
+              {weatherInfo.condition_icon} {weatherInfo.city} · {weatherInfo.temperature.toFixed(0)}°C ·{' '}
+              {weatherInfo.condition} · {environment === 'indoor' ? '🏠 Indoor' : environment === 'outdoor' ? '🌿 Outdoor' : '🔄 Both'}
+            </Text>
+            {weatherInfo.style_advisory ? (
+              <Text style={[styles.weatherAdvisory, { color: isDark ? '#A0D8FF' : '#005099' }]} numberOfLines={1}>
+                💡 {weatherInfo.style_advisory}
+              </Text>
+            ) : null}
+          </View>
+        )}
 
         {/* ── Empty welcome state ── */}
         {isEmpty && (
@@ -396,6 +582,20 @@ export default function StylistScreen() {
               <Text style={[styles.welcomeSub, { color: isDark ? '#AEAEB2' : '#6C6C70' }]}>
                 Ask me about any occasion, get outfit suggestions from your actual wardrobe, or get style advice.
               </Text>
+            
+              {!weatherInfo && (
+                <TouchableOpacity
+                  style={[styles.locationPromptBtn, { borderColor: isDark ? '#3A3A3C' : '#D1D1D6' }]}
+                  onPress={() => setShowEnvModal(true)}
+                  activeOpacity={0.75}
+                >
+                  <Text style={{ fontSize: 15 }}>🌍</Text>
+                  <Text style={[styles.locationPromptText, { color: isDark ? '#FFF' : '#1A1A1A' }]}>
+                    Set venue type for smart suggestions
+                  </Text>
+                  <Ionicons name="chevron-forward" size={14} color={isDark ? '#636366' : '#AEAEB2'} />
+                </TouchableOpacity>
+              )}
             </View>
 
             {/* Quick prompt chips */}
@@ -429,8 +629,16 @@ export default function StylistScreen() {
             keyExtractor={m => m.id}
             contentContainerStyle={styles.messageList}
             showsVerticalScrollIndicator={false}
-            onContentSizeChange={scrollToBottom}
-            renderItem={({ item }) => <Bubble msg={item} isDark={isDark} />}
+            renderItem={({ item }) => (
+              <AnimatedMessage>
+                <Bubble
+                  msg={item}
+                  isDark={isDark}
+                  wornToday={!!wornTodayMap[item.id]}
+                  onWearToday={() => handleWearToday(item.id, item.outfitItems ?? [])}
+                />
+              </AnimatedMessage>
+            )}
             ListFooterComponent={isThinking ? <TypingIndicator isDark={isDark} /> : null}
           />
         )}
@@ -449,6 +657,9 @@ export default function StylistScreen() {
             {
               backgroundColor: isDark ? '#1C1C1E' : '#F2F2F7',
               borderTopColor: isDark ? '#2C2C2E' : '#E5E5EA',
+              paddingBottom: Platform.OS === 'ios'
+                ? (keyboardShown ? 10 : 10 + iosTabBarOffset)
+                : 10,
             },
           ]}
         >
@@ -496,6 +707,80 @@ export default function StylistScreen() {
           </TouchableOpacity>
         </View>
       </KeyboardAvoidingView>
+
+      {/* ── Indoor / Outdoor Environment Popup ── */}
+<Modal
+        visible={showEnvModal}
+        transparent
+        animationType="slide"
+        onRequestClose={() => setShowEnvModal(false)}
+      >
+        <View style={styles.envModalOverlay}>
+          <View style={[styles.envModalCard, { backgroundColor: isDark ? '#1C1C1E' : '#FFFFFF' }]}>
+            <View style={styles.envModalHeader}>
+              <Text style={styles.envModalIcon}>🌤</Text>
+              <View style={{ flex: 1 }}>
+                <Text style={[styles.envModalTitle, { color: isDark ? '#FFF' : '#1A1A1A' }]}>
+                  Venue Type
+                </Text>
+                <Text style={[styles.envModalSub, { color: isDark ? '#AEAEB2' : '#6C6C70' }]}>
+                  Your AI stylist uses weather + skin tone + body shape for perfect outfit picks.
+                </Text>
+              </View>
+            </View>
+            {/* City override input */}
+            <View style={[styles.cityInputRow, { borderColor: isDark ? '#3A3A3C' : '#E5E5EA' }]}>
+              <Ionicons name="location-outline" size={16} color={isDark ? '#636366' : '#AEAEB2'} />
+              <TextInput
+                style={[styles.cityTextInput, { color: isDark ? '#FFF' : '#1A1A1A' }]}
+                placeholder="Or type a city (e.g. London, Tokyo)"
+                placeholderTextColor={isDark ? '#636366' : '#AEAEB2'}
+                value={cityInput}
+                onChangeText={setCityInput}
+                returnKeyType="done"
+                autoCapitalize="words"
+              />
+              {pendingCoords && !cityInput && (
+                <View style={styles.gpsTag}>
+                  <Text style={styles.gpsTagText}>📍 GPS</Text>
+                </View>
+              )}
+            </View>
+            {locationLoading && (
+              <View style={styles.envLoadingRow}>
+                <ActivityIndicator size="small" color="#0A84FF" />
+                <Text style={[styles.envLoadingText, { color: isDark ? '#AEAEB2' : '#6C6C70' }]}>Fetching weather...</Text>
+              </View>
+            )}
+            {locationError && <Text style={styles.weatherErrorText}>{locationError}</Text>}
+            <Text style={[styles.envSectionLabel, { color: isDark ? '#AEAEB2' : '#6C6C70' }]}>Select venue</Text>
+            <TouchableOpacity style={[styles.envBigBtn, { backgroundColor: '#007AFF' }]} onPress={() => handleConfirmEnvironment('indoor')} activeOpacity={0.85}>
+              <Text style={styles.envBigIcon}>🏠</Text>
+              <View style={{ flex: 1 }}>
+                <Text style={styles.envBigLabel}>Indoor</Text>
+                <Text style={styles.envBigSub}>Office, mall, restaurant, home</Text>
+              </View>
+            </TouchableOpacity>
+            <TouchableOpacity style={[styles.envBigBtn, { backgroundColor: '#34C759' }]} onPress={() => handleConfirmEnvironment('outdoor')} activeOpacity={0.85}>
+              <Text style={styles.envBigIcon}>🌿</Text>
+              <View style={{ flex: 1 }}>
+                <Text style={styles.envBigLabel}>Outdoor</Text>
+                <Text style={styles.envBigSub}>Park, street, events, travel</Text>
+              </View>
+            </TouchableOpacity>
+            <TouchableOpacity style={[styles.envBigBtn, { backgroundColor: '#FF9500' }]} onPress={() => handleConfirmEnvironment('both')} activeOpacity={0.85}>
+              <Text style={styles.envBigIcon}>🔄</Text>
+              <View style={{ flex: 1 }}>
+                <Text style={styles.envBigLabel}>Both</Text>
+                <Text style={styles.envBigSub}>Moving between indoor and outdoor</Text>
+              </View>
+            </TouchableOpacity>
+            <TouchableOpacity style={styles.envSkipBtn} onPress={() => setShowEnvModal(false)}>
+              <Text style={[styles.envSkipText, { color: isDark ? '#636366' : '#AEAEB2' }]}>Skip for now</Text>
+            </TouchableOpacity>
+          </View>
+        </View>
+      </Modal>
     </SafeAreaView>
   );
 }
@@ -717,13 +1002,13 @@ const styles = StyleSheet.create({
     marginTop: 8,
   },
 
-  // Input bar
+  // Input bar (paddingBottom is overridden inline to account for absolute tab bar on iOS)
   inputBar: {
     flexDirection: 'row',
     alignItems: 'flex-end',
     paddingHorizontal: 12,
-    paddingVertical: 10,
-    paddingBottom: Platform.OS === 'ios' ? 28 : 10,
+    paddingTop: 10,
+    paddingBottom: 10,
     borderTopWidth: StyleSheet.hairlineWidth,
     gap: 8,
   },
@@ -743,5 +1028,260 @@ const styles = StyleSheet.create({
     justifyContent: 'center',
     alignItems: 'center',
     marginBottom: 2,
+  },
+
+  // Wear today button
+  wearButton: {
+    marginTop: 10,
+    alignSelf: 'flex-start',
+    borderWidth: 1,
+    borderRadius: 20,
+    paddingHorizontal: 14,
+    paddingVertical: 7,
+  },
+  wearButtonDone: {
+    borderColor: '#30D158',
+  },
+  wearButtonText: {
+    fontSize: 13,
+    fontWeight: '600',
+  },
+  // Weather UI
+  weatherBtn: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 4,
+    borderRadius: 16,
+    paddingHorizontal: 10,
+    paddingVertical: 6,
+  },
+  weatherBtnTemp: {
+    fontSize: 13,
+    fontWeight: '700',
+    color: '#FFF',
+  },
+  weatherBanner: {
+    marginHorizontal: 12,
+    marginBottom: 6,
+    borderRadius: 10,
+    paddingHorizontal: 12,
+    paddingVertical: 8,
+  },
+  weatherBannerText: {
+    fontSize: 12,
+    fontWeight: '600',
+  },
+  weatherAdvisory: {
+    fontSize: 11,
+    marginTop: 2,
+  },
+  locationPromptBtn: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 8,
+    marginTop: 12,
+    borderWidth: 1,
+    borderRadius: 12,
+    paddingHorizontal: 12,
+    paddingVertical: 9,
+    alignSelf: 'stretch',
+  },
+  locationPromptText: {
+    flex: 1,
+    fontSize: 13,
+    fontWeight: '500',
+  },
+  // Modal
+  modalOverlay: {
+    flex: 1,
+    backgroundColor: 'rgba(0,0,0,0.55)',
+    justifyContent: 'flex-end',
+  },
+  modalCard: {
+    borderTopLeftRadius: 24,
+    borderTopRightRadius: 24,
+    padding: 24,
+    paddingBottom: 40,
+  },
+  modalTitle: {
+    fontSize: 20,
+    fontWeight: '700',
+    marginBottom: 6,
+  },
+  modalSub: {
+    fontSize: 14,
+    marginBottom: 16,
+    lineHeight: 20,
+  },
+  locationInput: {
+    fontSize: 15,
+    borderWidth: 1,
+    borderRadius: 12,
+    paddingHorizontal: 14,
+    paddingVertical: 12,
+    marginBottom: 16,
+  },
+  envLabel: {
+    fontSize: 13,
+    fontWeight: '600',
+    marginBottom: 10,
+    textTransform: 'uppercase',
+    letterSpacing: 0.5,
+  },
+  envRow: {
+    flexDirection: 'row',
+    gap: 10,
+    marginBottom: 16,
+  },
+  envChip: {
+    flex: 1,
+    alignItems: 'center',
+    borderWidth: 1,
+    borderRadius: 14,
+    paddingVertical: 10,
+    gap: 4,
+  },
+  envChipText: {
+    fontSize: 12,
+    fontWeight: '600',
+  },
+  weatherErrorText: {
+    color: '#FF453A',
+    fontSize: 13,
+    marginBottom: 12,
+  },
+  fetchWeatherBtn: {
+    backgroundColor: '#0A84FF',
+    borderRadius: 14,
+    paddingVertical: 14,
+    alignItems: 'center',
+    marginBottom: 10,
+  },
+  fetchWeatherBtnText: {
+    color: '#FFF',
+    fontSize: 16,
+    fontWeight: '700',
+  },
+  modalCancelBtn: {
+    alignItems: 'center',
+    paddingVertical: 8,
+  },
+  modalCancelText: {
+    fontSize: 14,
+  },
+  // Environment modal styles
+  envModalOverlay: {
+    flex: 1,
+    backgroundColor: 'rgba(0,0,0,0.6)',
+    justifyContent: 'center',
+    paddingHorizontal: 20,
+  },
+  envModalCard: {
+    borderRadius: 24,
+    padding: 28,
+    alignItems: 'center',
+    shadowColor: '#000',
+    shadowOpacity: 0.3,
+    shadowRadius: 20,
+    elevation: 12,
+  },
+  envModalIcon: {
+    fontSize: 52,
+    marginBottom: 12,
+  },
+  envModalTitle: {
+    fontSize: 22,
+    fontWeight: '700',
+    textAlign: 'center',
+    marginBottom: 8,
+  },
+  envModalSub: {
+    fontSize: 14,
+    textAlign: 'center',
+    lineHeight: 20,
+    marginBottom: 24,
+  },
+  envLoadingRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 8,
+    marginBottom: 16,
+  },
+  envLoadingText: {
+    fontSize: 13,
+  },
+  envBigBtn: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 14,
+    borderRadius: 16,
+    paddingHorizontal: 20,
+    paddingVertical: 16,
+    marginBottom: 12,
+    alignSelf: 'stretch',
+  },
+  envBigIcon: {
+    fontSize: 30,
+  },
+  envBigLabel: {
+    color: '#FFF',
+    fontSize: 17,
+    fontWeight: '700',
+  },
+  envBigSub: {
+    color: 'rgba(255,255,255,0.8)',
+    fontSize: 12,
+    marginTop: 2,
+  },
+  envSkipBtn: {
+    marginTop: 8,
+    paddingVertical: 10,
+  },
+  envSkipText: {
+    fontSize: 13,
+  },
+  // City input + venue modal extras
+  envModalHeader: {
+    flexDirection: 'row',
+    alignItems: 'flex-start',
+    gap: 12,
+    marginBottom: 16,
+    alignSelf: 'stretch',
+  },
+  envSectionLabel: {
+    fontSize: 11,
+    fontWeight: '700',
+    textTransform: 'uppercase',
+    letterSpacing: 0.8,
+    marginBottom: 10,
+    marginTop: 4,
+    alignSelf: 'flex-start',
+  },
+  cityInputRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    borderWidth: 1,
+    borderRadius: 12,
+    paddingHorizontal: 12,
+    paddingVertical: 10,
+    gap: 8,
+    marginBottom: 16,
+    alignSelf: 'stretch',
+  },
+  cityTextInput: {
+    flex: 1,
+    fontSize: 14,
+    padding: 0,
+  },
+  gpsTag: {
+    backgroundColor: '#34C759',
+    borderRadius: 8,
+    paddingHorizontal: 8,
+    paddingVertical: 3,
+  },
+  gpsTagText: {
+    color: '#FFF',
+    fontSize: 11,
+    fontWeight: '700',
   },
 });

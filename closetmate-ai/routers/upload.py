@@ -1,5 +1,3 @@
-import os
-import tempfile
 from pathlib import Path
 from typing import Optional
 
@@ -7,7 +5,7 @@ from fastapi import APIRouter, File, HTTPException, UploadFile
 from pydantic import BaseModel
 
 from database import get_cached_metadata, save_metadata_cache
-from services.image_processing import remove_background_and_save_from_path
+from services.image_processing import remove_background_and_save
 from services.metadata_extractor import extract_clothing_metadata, get_image_hash
 
 router = APIRouter()
@@ -62,32 +60,22 @@ async def upload_clothing(file: UploadFile = File(...)) -> UploadClothingRespons
         raise HTTPException(status_code=400, detail="Empty file")
 
     suffix = Path(file.filename or "image").suffix or ".jpg"
-    tmp_path = None
+    # ── Try background removal first ─────────────────────────────────────
     try:
-        with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
-            tmp.write(body)
-            tmp_path = tmp.name
-
-        # ── Try background removal first ─────────────────────────────────────
-        try:
-            image_path = remove_background_and_save_from_path(tmp_path)
-            status = "background_removed"
-        except Exception as bg_err:
-            # Background removal failed — save the original image as a fallback
-            import uuid as _uuid
-            from pathlib import Path as _Path
-            fallback_dir = _Path(__file__).resolve().parent.parent / "uploads" / "processed"
-            fallback_dir.mkdir(parents=True, exist_ok=True)
-            fallback_name = f"{_uuid.uuid4().hex}{suffix}"
-            fallback_path = fallback_dir / fallback_name
-            fallback_path.write_bytes(body)
-            image_path = f"uploads/processed/{fallback_name}"
-            status = "original_saved"
-            print(f"[upload-clothing] Background removal failed ({bg_err}); saved original as {image_path}")
-
-    finally:
-        if tmp_path and os.path.exists(tmp_path):
-            os.unlink(tmp_path)
+        image_path = remove_background_and_save(body)
+        status = "background_removed"
+    except Exception as bg_err:
+        # Background removal failed — save the original image as a fallback
+        import uuid as _uuid
+        from pathlib import Path as _Path
+        fallback_dir = _Path(__file__).resolve().parent.parent / "uploads" / "processed"
+        fallback_dir.mkdir(parents=True, exist_ok=True)
+        fallback_name = f"{_uuid.uuid4().hex}{suffix}"
+        fallback_path = fallback_dir / fallback_name
+        fallback_path.write_bytes(body)
+        image_path = f"uploads/processed/{fallback_name}"
+        status = "original_saved"
+        print(f"[upload-clothing] Background removal failed ({bg_err}); saved original as {image_path}")
 
     return UploadClothingResponse(
         image_path=image_path,

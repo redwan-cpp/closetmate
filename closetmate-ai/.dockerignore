@@ -1,0 +1,13 @@
+venv/
+__pycache__/
+*.pyc
+*.pyo
+.env
+.git/
+*.db
+uploads/
+*.log
+.vscode/
+node_modules/
+.onnx/
+.u2net/

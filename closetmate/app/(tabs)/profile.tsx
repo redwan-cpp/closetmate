@@ -4,7 +4,7 @@
  * Shows: avatar (uploadable), name, body shape, skin tone, worn history
  * All data pulled from the backend using the logged-in user_id.
  */
-import React, { useState, useEffect, useCallback } from 'react';
+import React, { useState, useCallback } from 'react';
 import {
   StyleSheet, View, Text, ScrollView, TouchableOpacity,
   useColorScheme, ActivityIndicator, Alert, Image,
@@ -14,8 +14,9 @@ import { SafeAreaView } from 'react-native-safe-area-context';
 import { Ionicons } from '@expo/vector-icons';
 import * as ImagePicker from 'expo-image-picker';
 import { useAuth } from '@/src/context/AuthContext';
-import { AI_BASE_URL } from '@/src/api/ai';
+import { AI_BASE_URL, getWornHistory, WornLog } from '@/src/api/ai';
 import { useRouter } from 'expo-router';
+import { useFocusEffect } from '@react-navigation/native';
 
 const { width } = Dimensions.get('window');
 
@@ -61,13 +62,6 @@ interface UserProfile {
   created_at: string;
 }
 
-interface WardrobeItem {
-  item_id: string;
-  image_path: string | null;
-  category: string | null;
-  created_at: string;
-}
-
 export default function ProfileScreen() {
   const colorScheme = useColorScheme();
   const isDark = colorScheme === 'dark';
@@ -76,10 +70,10 @@ export default function ProfileScreen() {
   const { user_id, token, signOut } = useAuth();
 
   const [profile, setProfile]       = useState<UserProfile | null>(null);
-  const [wardrobe, setWardrobe]      = useState<WardrobeItem[]>([]);
+  const [wornHistory, setWornHistory] = useState<WornLog[]>([]);
   const [avatarUri, setAvatarUri]    = useState<string | null>(null);
   const [loadingProfile, setLoadingProfile] = useState(true);
-  const [loadingWardrobe, setLoadingWardrobe] = useState(true);
+  const [loadingHistory, setLoadingHistory] = useState(true);
 
   // ── Fetch profile ──
   const fetchProfile = useCallback(async () => {
@@ -101,28 +95,28 @@ export default function ProfileScreen() {
     }
   }, [token]);
 
-  // ── Fetch wardrobe for recent history ──
-  const fetchWardrobe = useCallback(async () => {
+  // ── Fetch worn history ──
+  const fetchWornHistory = useCallback(async () => {
     if (!user_id) {
-      setLoadingWardrobe(false);
+      setLoadingHistory(false);
       return;
     }
     try {
-      const res = await fetch(`${AI_BASE_URL}/wardrobe/items/${user_id}`);
-      if (!res.ok) throw new Error(`HTTP ${res.status}`);
-      const data: WardrobeItem[] = await res.json();
-      setWardrobe(data);
+      const data = await getWornHistory(user_id, 7);
+      setWornHistory(data);
     } catch (e) {
-      console.warn('Wardrobe fetch error:', e);
+      console.warn('Worn history fetch error:', e);
     } finally {
-      setLoadingWardrobe(false);
+      setLoadingHistory(false);
     }
   }, [user_id]);
 
-  useEffect(() => {
-    fetchProfile();
-    fetchWardrobe();
-  }, [fetchProfile, fetchWardrobe]);
+  useFocusEffect(
+    useCallback(() => {
+      fetchProfile();
+      fetchWornHistory();
+    }, [fetchProfile, fetchWornHistory])
+  );
 
   // ── Avatar pick ──
   const pickAvatar = async () => {
@@ -159,11 +153,19 @@ export default function ProfileScreen() {
   const skinInfo  = profile?.skin_tone  ? SKIN_TONE_MAP[profile.skin_tone]   : null;
   const shapeInfo = profile?.body_shape ? BODY_SHAPE_MAP[profile.body_shape] : null;
 
-  // ── Recent 7 items as "worn history" slots ──
-  const historySlots = Array.from({ length: 7 }, (_, i) => ({
-    day: DAYS[i],
-    item: wardrobe[i] ?? null,
-  }));
+  // Build 7 history slots from real worn logs (each slot shows the full outfit combo)
+  const historySlots = Array.from({ length: 7 }, (_, i) => {
+    const log = wornHistory[i] ?? null;
+    const imgUrls =
+      log?.items
+        .map((it) => it.image_path)
+        .filter((u): u is string => !!u) ?? [];
+    const label = log
+      ? new Date(log.worn_date + 'T00:00:00').toLocaleDateString('en-US', { month: 'short', day: 'numeric' })
+      : DAYS[i];
+    const pieceCount = log?.items.length ?? 0;
+    return { label, imgUrls, pieceCount };
+  });
 
   if (loadingProfile) {
     return (
@@ -266,38 +268,63 @@ export default function ProfileScreen() {
         {/* ── Worn History ── */}
         <View style={[styles.card, { backgroundColor: c.surface, borderColor: c.border }]}>
           <View style={styles.cardHeader}>
-            <Text style={[styles.cardTitle, { color: c.text }]}>Wardrobe History</Text>
-            <Text style={[styles.cardMeta, { color: c.subtext }]}>{wardrobe.length} item{wardrobe.length !== 1 ? 's' : ''}</Text>
+            <Text style={[styles.cardTitle, { color: c.text }]}>Worn History</Text>
+            <Text style={[styles.cardMeta, { color: c.subtext }]}>
+              {wornHistory.length} outfit{wornHistory.length !== 1 ? 's' : ''} logged
+            </Text>
           </View>
 
-          {loadingWardrobe ? (
+          {loadingHistory ? (
             <ActivityIndicator color={c.subtext} style={{ marginVertical: 20 }} />
-          ) : wardrobe.length === 0 ? (
+          ) : wornHistory.length === 0 ? (
             <EmptyState
               icon="shirt-outline"
-              message="Your wardrobe is empty."
-              subMessage="Add your first clothing item using the camera button below."
+              message="No outfits logged yet."
+              subMessage={'Tap “Wearing this today” in the AI Stylist chat to start tracking.'}
               c={c}
             />
           ) : (
             <View style={styles.historyRow}>
-              {historySlots.map(({ day, item }, i) => {
-                const imgUrl = item?.image_path
-                  ? `${AI_BASE_URL}/${item.image_path}`
-                  : null;
-                return (
-                  <View key={i} style={styles.historyColumn}>
-                    <Text style={[styles.historyDay, { color: c.subtext }]}>{day}</Text>
-                    <View style={[styles.historyCell, { backgroundColor: c.bg, borderColor: c.border }]}>
-                      {imgUrl ? (
-                        <Image source={{ uri: imgUrl }} style={styles.historyImage} resizeMode="cover" />
-                      ) : (
-                        <Ionicons name="shirt-outline" size={16} color={c.border} />
-                      )}
-                    </View>
+              {historySlots.map(({ label, imgUrls, pieceCount }, i) => (
+                <View key={i} style={styles.historyColumn}>
+                  <View style={[styles.historyCell, { backgroundColor: c.bg, borderColor: c.border }]}>
+                    {imgUrls.length === 0 ? (
+                      <Ionicons name="shirt-outline" size={16} color={c.border} />
+                    ) : imgUrls.length === 1 ? (
+                      <Image source={{ uri: imgUrls[0] }} style={styles.historyImage} resizeMode="cover" />
+                    ) : (
+                      <View style={styles.historyComboWrap}>
+                        {imgUrls.slice(0, 4).map((uri, idx) => (
+                          <Image
+                            key={`${uri}-${idx}`}
+                            source={{ uri }}
+                            style={[
+                              styles.historyComboImg,
+                              {
+                                left: `${6 + idx * 16}%`,
+                                zIndex: idx + 1,
+                                borderColor: c.border,
+                              },
+                            ]}
+                            resizeMode="cover"
+                          />
+                        ))}
+                        {imgUrls.length > 4 ? (
+                          <View style={[styles.historyMoreBadge, { borderColor: c.border, backgroundColor: c.surface }]}>
+                            <Text style={[styles.historyMoreText, { color: c.text }]}>+{imgUrls.length - 4}</Text>
+                          </View>
+                        ) : null}
+                      </View>
+                    )}
                   </View>
-                );
-              })}
+                  <Text style={[styles.historyDay, { color: c.subtext }]} numberOfLines={1}>{label}</Text>
+                  {pieceCount > 1 ? (
+                    <Text style={[styles.historyPieces, { color: c.border }]} numberOfLines={1}>
+                      {pieceCount} pcs
+                    </Text>
+                  ) : null}
+                </View>
+              ))}
             </View>
           )}
         </View>
@@ -430,6 +457,32 @@ const styles = StyleSheet.create({
     overflow: 'hidden', justifyContent: 'center', alignItems: 'center', borderWidth: 1,
   },
   historyImage: { width: '100%', height: '100%' },
+  historyComboWrap: {
+    width: '100%',
+    height: '100%',
+    position: 'relative',
+  },
+  historyComboImg: {
+    position: 'absolute',
+    bottom: '6%',
+    width: '58%',
+    height: '82%',
+    borderRadius: 6,
+    borderWidth: 1.5,
+  },
+  historyMoreBadge: {
+    position: 'absolute',
+    right: 2,
+    bottom: 2,
+    minWidth: 18,
+    paddingHorizontal: 3,
+    paddingVertical: 1,
+    borderRadius: 4,
+    borderWidth: 1,
+    zIndex: 10,
+  },
+  historyMoreText: { fontSize: 8, fontWeight: '800' },
+  historyPieces: { fontSize: 8, fontWeight: '600', marginTop: 2 },
 
   insightText: { fontSize: 14, lineHeight: 22 },
 });

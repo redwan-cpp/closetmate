@@ -179,3 +179,102 @@ async def recommend_outfits(request: RecommendationRequest):
         culture=request.culture,
     )
     return result
+
+
+# ─────────────────────────────────────────────
+# POST /wardrobe/log-worn
+# ─────────────────────────────────────────────
+
+class LogWornPayload(BaseModel):
+    user_id: str
+    item_ids: List[str]  # list of item_id strings from the AI suggestion
+
+
+@router.post("/log-worn")
+def log_worn_outfit(
+    payload: LogWornPayload,
+    db: Any = Depends(get_db),
+):
+    """Record that the user is wearing a specific outfit today."""
+    import json as _json
+    log_id  = str(uuid.uuid4())
+    now     = datetime.now(timezone.utc)
+    worn_date = now.date().isoformat()   # "2026-04-25"
+
+    db.execute(
+        text("""
+        INSERT INTO worn_logs (log_id, user_id, worn_date, item_ids, created_at)
+        VALUES (:log_id, :user_id, :worn_date, :item_ids, :created_at)
+        """),
+        {
+            "log_id":    log_id,
+            "user_id":   payload.user_id,
+            "worn_date": worn_date,
+            "item_ids":  _json.dumps(payload.item_ids),
+            "created_at": now.isoformat(),
+        },
+    )
+    db.commit()
+    return {"status": "logged", "log_id": log_id, "worn_date": worn_date}
+
+
+# ─────────────────────────────────────────────
+# GET /wardrobe/worn-history/{user_id}
+# ─────────────────────────────────────────────
+
+class WornItem(BaseModel):
+    item_id: str
+    image_path: Optional[str]
+    category: Optional[str]
+    subcategory: Optional[str]
+    primary_color: Optional[str]
+
+class WornLogOut(BaseModel):
+    log_id: str
+    worn_date: str
+    items: List[WornItem]
+
+@router.get("/worn-history/{user_id}", response_model=List[WornLogOut])
+def get_worn_history(
+    user_id: str,
+    limit: int = 7,
+    db: Any = Depends(get_db),
+):
+    """Return the last `limit` worn outfit logs for the user, with item images."""
+    import json as _json
+
+    rows = db.execute(
+        text("""
+        SELECT log_id, worn_date, item_ids
+        FROM worn_logs
+        WHERE user_id = :uid
+        ORDER BY worn_date DESC, created_at DESC
+        LIMIT :lim
+        """),
+        {"uid": user_id, "lim": limit},
+    ).fetchall()
+
+    result = []
+    for row in rows:
+        item_ids = _json.loads(row["item_ids"])
+        items = []
+        for iid in item_ids:
+            w = db.execute(
+                text("SELECT item_id, image_path, category, subcategory, primary_color FROM wardrobe_items WHERE item_id = :iid"),
+                {"iid": iid},
+            ).fetchone()
+            if w:
+                items.append(WornItem(
+                    item_id=w["item_id"],
+                    image_path=w["image_path"],
+                    category=w["category"],
+                    subcategory=w["subcategory"],
+                    primary_color=w["primary_color"],
+                ))
+        result.append(WornLogOut(
+            log_id=row["log_id"],
+            worn_date=row["worn_date"],
+            items=items,
+        ))
+    return result
+

@@ -17,16 +17,23 @@ import { useFocusEffect, useRouter } from 'expo-router';
 import { Ionicons } from '@expo/vector-icons';
 import { useColorScheme } from '@/hooks/use-color-scheme';
 import { Colors, Spacing, BorderRadius } from '@/constants/theme';
-import { getWardrobeItems, deleteWardrobeItem, WardrobeItem, AI_BASE_URL } from '@/src/api/ai';
+import { getWardrobeItems, deleteWardrobeItem, WardrobeItem } from '@/src/api/ai';
 import ActionSheetModal from '@/components/ActionSheetModal';
 import { useAuth } from '@/src/context/AuthContext';
 
-/** Ensure image_path is always a full http URL, not a relative server path. */
+/** Ensure image_path is always a full displayable URI. */
 function resolveImageUrl(imagePath: string | null | undefined): string {
   if (!imagePath) return '';
-  if (imagePath.startsWith('http')) return imagePath;
-  // Normalize Windows backslashes and prepend base URL
-  return `${AI_BASE_URL}/${imagePath.replace(/\\/g, '/')}`;
+  // Already a complete URI — data:, file:, or http(s): — pass through as-is
+  if (
+    imagePath.startsWith('data:') ||
+    imagePath.startsWith('file:') ||
+    imagePath.startsWith('http')
+  ) return imagePath;
+  // Legacy server-relative path (e.g. "uploads/processed/abc.png")
+  // These only work when the backend is running. New items no longer use this format.
+  const CLOUD_BASE = 'https://closetmate-ai-801722190488.us-central1.run.app';
+  return `${CLOUD_BASE}/${imagePath.replace(/\\/g, '/')}`;
 }
 
 // ---------------------------------------------------------------------------
@@ -80,7 +87,7 @@ interface CategoryCardProps {
 
 const CategoryCard = memo(({ label, icon, count, previewUri, isDark, onPress }: CategoryCardProps) => {
   const scale = useRef(new Animated.Value(1)).current;
-  const imgOpacity = useRef(new Animated.Value(1)).current; // start visible immediately
+  const imgOpacity = useRef(new Animated.Value(1)).current;
 
   const onPressIn = () => Animated.spring(scale, { toValue: 0.96, useNativeDriver: true, speed: 30 }).start();
   const onPressOut = () => Animated.spring(scale, { toValue: 1, useNativeDriver: true, speed: 20 }).start();
@@ -101,6 +108,9 @@ const CategoryCard = memo(({ label, icon, count, previewUri, isDark, onPress }: 
         ) : (
           <View style={[StyleSheet.absoluteFillObject, styles.cardPlaceholder, { backgroundColor: isDark ? '#252525' : '#F5F5F5' }]}>
             <Ionicons name={icon} size={40} color={isDark ? '#3A3A3A' : '#DCDCDC'} />
+            <Text style={{ fontSize: 10, color: isDark ? '#444' : '#CCC', marginTop: 6, textAlign: 'center', paddingHorizontal: 8 }}>
+              Tap to view · re-add to show photo
+            </Text>
           </View>
         )}
         <View style={styles.labelRow}>
@@ -123,11 +133,10 @@ interface DetailCardProps {
 
 const DetailCard = memo(({ item, isDark, onLongPress }: DetailCardProps) => {
   const scale = useRef(new Animated.Value(1)).current;
-  const opacity = useRef(new Animated.Value(1)).current; // start visible, no fade-in delay
+  const opacity = useRef(new Animated.Value(1)).current;
 
   const uri = resolveImageUrl(item.image_path);
   const ok = uri.startsWith('http') || uri.startsWith('data:') || uri.startsWith('file:');
-  if (!ok) console.warn('[closet] DetailCard — no valid URI for item:', item.item_id, '| raw path:', item.image_path);
   const colorDot = resolveColorDot(item.primary_color);
 
   const onPressIn = () => Animated.spring(scale, { toValue: 0.96, useNativeDriver: true, speed: 30 }).start();
@@ -160,7 +169,10 @@ const DetailCard = memo(({ item, isDark, onLongPress }: DetailCardProps) => {
           />
         ) : (
           <View style={[styles.cardPlaceholder, { backgroundColor: isDark ? '#252525' : '#F5F5F5' }]}>
-            <Ionicons name="shirt-outline" size={36} color={isDark ? '#3A3A3A' : '#DDD'} />
+            <Ionicons name="image-outline" size={36} color={isDark ? '#3A3A3A' : '#DDD'} />
+            <Text style={{ fontSize: 10, color: isDark ? '#444' : '#CCC', marginTop: 6, textAlign: 'center', paddingHorizontal: 12 }}>
+              Delete &amp; re-add{`\n`}to restore photo
+            </Text>
           </View>
         )}
 

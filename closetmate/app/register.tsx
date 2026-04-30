@@ -6,20 +6,32 @@
  * Step 3: Skin tone (from face scan or manual pick)
  * Final: POST to backend → auto-login → home
  */
-import React, { useState, useRef } from 'react';
+import React, { useState, useRef, useEffect } from 'react';
 import {
   View, Text, TextInput, TouchableOpacity, StyleSheet,
   ScrollView, ActivityIndicator, Alert, KeyboardAvoidingView,
-  Platform, useColorScheme, StatusBar, Dimensions,
+  Platform, useColorScheme, StatusBar, Dimensions, Image,
 } from 'react-native';
 import { SafeAreaView } from 'react-native-safe-area-context';
 import { useRouter } from 'expo-router';
 import { Ionicons } from '@expo/vector-icons';
-import { registerUser, loginUser } from '@/src/api/auth';
+import { LinearGradient } from 'expo-linear-gradient';
+import * as ImagePicker from 'expo-image-picker';
+import { registerUser, loginUser, detectSkinTone } from '@/src/api/auth';
 import { useAuth } from '@/src/context/AuthContext';
 
 const { width } = Dimensions.get('window');
 const CARD_W = (width - 24 * 2 - 12) / 2;
+const FACE_RING = width * 0.48;
+
+// Maps API skin_tone values → display config for the selfie ring badge
+const TONE_CONFIG: Record<string, { label: string; hex: string; gradient: [string, string] }> = {
+  'light':        { label: 'Light',        hex: '#FDDBB4', gradient: ['#FDDBB4', '#F5C5A3'] },
+  'light-medium': { label: 'Light Medium', hex: '#E8A87C', gradient: ['#E8A87C', '#D4956A'] },
+  'medium':       { label: 'Medium',       hex: '#C68642', gradient: ['#C68642', '#A07030'] },
+  'medium-deep':  { label: 'Medium Deep',  hex: '#8D5524', gradient: ['#8D5524', '#6B3A15'] },
+  'deep':         { label: 'Deep',         hex: '#3B1A0A', gradient: ['#6B3A2A', '#3B1A0A'] },
+};
 
 // ─────────────────────────────────────────────
 // Data
@@ -90,14 +102,13 @@ const BODY_SHAPES = [
   },
 ];
 
+// IDs match the API's skin_tone field values (hyphens, not underscores)
 const SKIN_TONES = [
-  { id: 'fair',        label: 'Fair',         color: '#FDDBB4' },
-  { id: 'light',       label: 'Light',        color: '#F5C5A3' },
-  { id: 'light_medium',label: 'Light Medium', color: '#E8A87C' },
-  { id: 'medium',      label: 'Medium',       color: '#C68642' },
-  { id: 'medium_dark', label: 'Medium Dark',  color: '#A0522D' },
-  { id: 'dark',        label: 'Dark',         color: '#6B3A2A' },
-  { id: 'deep',        label: 'Deep',         color: '#3B1A0A' },
+  { id: 'light',        label: 'Light',        color: '#FDDBB4' },
+  { id: 'light-medium', label: 'Light Medium', color: '#E8A87C' },
+  { id: 'medium',       label: 'Medium',       color: '#C68642' },
+  { id: 'medium-deep',  label: 'Medium Deep',  color: '#8D5524' },
+  { id: 'deep',         label: 'Deep',         color: '#3B1A0A' },
 ];
 
 // ─────────────────────────────────────────────
@@ -129,6 +140,55 @@ export default function RegisterScreen() {
 
   // Step 3 fields
   const [skinTone, setSkinTone] = useState<string | null>(null);
+
+  // Step 3 — face scan extra state
+  const [imageUri, setImageUri]         = useState<string | null>(null);
+  const [scanning, setScanning]         = useState(false);
+  const [scanHex, setScanHex]           = useState<string | null>(null);   // hex from API
+  const [scanLabel, setScanLabel]       = useState<string | null>(null);  // display_label from API
+
+  // Auto-launch camera when Step 3 appears
+  useEffect(() => {
+    if (step === 3) {
+      const t = setTimeout(takeSelfie, 350);
+      return () => clearTimeout(t);
+    }
+  }, [step]);
+
+  const takeSelfie = async () => {
+    const { status } = await ImagePicker.requestCameraPermissionsAsync();
+    if (status !== 'granted') {
+      Alert.alert('Permission needed', 'Camera access is required for skin tone detection.');
+      return;
+    }
+    const result = await ImagePicker.launchCameraAsync({
+      cameraType: ImagePicker.CameraType.front,
+      quality: 0.85,
+      allowsEditing: false,
+    });
+    if (!result.canceled) {
+      const uri = result.assets[0].uri;
+      setImageUri(uri);
+      await runScan(uri);
+    }
+  };
+
+  const runScan = async (uri: string) => {
+    setScanning(true);
+    setSkinTone(null);
+    setScanHex(null);
+    setScanLabel(null);
+    try {
+      const result = await detectSkinTone(uri);
+      setSkinTone(result.skin_tone);       // e.g. "light-medium"
+      setScanHex(result.hex_swatch);       // e.g. "#C8A882"
+      setScanLabel(result.display_label);  // e.g. "light-medium (warm)"
+    } catch (e) {
+      Alert.alert('Scan failed', 'Could not detect skin tone. Pick manually below.');
+    } finally {
+      setScanning(false);
+    }
+  };
 
   const [loading, setLoading] = useState(false);
 
@@ -372,16 +432,71 @@ export default function RegisterScreen() {
             </>
           )}
 
-          {/* ══════════ STEP 3 — Skin Tone ══════════ */}
+          {/* ══ STEP 3 — Skin Tone (face scan + manual) ══ */}
           {step === 3 && (
             <>
               <View style={styles.stepHeader}>
                 <Text style={[styles.stepTitle, { color: c.text }]}>Skin Tone</Text>
                 <Text style={[styles.stepSub, { color: c.subtext }]}>
-                  Step 3 of 3 — Helps us suggest complementary colors
+                  Step 3 of 3 — Selfie scan or pick manually
                 </Text>
               </View>
 
+              {/* ── Face ring — border color from detected hex swatch ── */}
+              <View style={styles.faceSection}>
+                <View style={[
+                  styles.faceRingGrad,
+                  { backgroundColor: scanHex ?? (skinTone && TONE_CONFIG[skinTone] ? TONE_CONFIG[skinTone].hex : '#7C3AED'), padding: 4, borderRadius: 999 },
+                ]}>
+                  <View style={[styles.faceRingInner, { backgroundColor: c.bg }]}>
+                    {imageUri ? (
+                      <Image source={{ uri: imageUri }} style={styles.faceImage} />
+                    ) : (
+                      <View style={styles.facePlaceholder}>
+                        <Ionicons name="person" size={60} color={isDark ? '#3D3D5C' : '#DDD8FF'} />
+                      </View>
+                    )}
+                    {scanning && (
+                      <View style={styles.scanOverlay}>
+                        <ActivityIndicator size="large" color="#FFF" />
+                        <Text style={styles.scanLabel}>Detecting skin tone…</Text>
+                      </View>
+                    )}
+                  </View>
+                </View>
+
+                {/* Detected result badge — shows actual tone + undertone label */}
+                {scanLabel && !scanning && (
+                  <View style={[styles.detectedBadge, { backgroundColor: scanHex ?? '#7C3AED' }]}>
+                    <View style={[styles.swatchDot, { backgroundColor: scanHex ?? '#888' }]} />
+                    <Text style={styles.detectedBadgeText}>
+                      {scanLabel}
+                    </Text>
+                  </View>
+                )}
+
+                {/* Camera action */}
+                <TouchableOpacity
+                  onPress={takeSelfie}
+                  disabled={scanning}
+                  style={[styles.cameraChip, { borderColor: c.border, backgroundColor: c.card }]}
+                  activeOpacity={0.8}
+                >
+                  <Ionicons name="camera" size={16} color="#7C3AED" style={{ marginRight: 6 }} />
+                  <Text style={[styles.cameraChipText, { color: c.text }]}>
+                    {imageUri ? 'Retake selfie' : 'Take selfie'}
+                  </Text>
+                </TouchableOpacity>
+              </View>
+
+              {/* Divider */}
+              <View style={styles.dividerRow}>
+                <View style={[styles.dividerLine, { backgroundColor: c.border }]} />
+                <Text style={[styles.dividerText, { color: c.subtext }]}>or pick manually</Text>
+                <View style={[styles.dividerLine, { backgroundColor: c.border }]} />
+              </View>
+
+              {/* Manual swatches */}
               <View style={[styles.card, { backgroundColor: c.card, borderColor: c.border }]}>
                 <View style={styles.skinGrid}>
                   {SKIN_TONES.map((tone) => {
@@ -389,17 +504,15 @@ export default function RegisterScreen() {
                     return (
                       <TouchableOpacity
                         key={tone.id}
-                        onPress={() => setSkinTone(isSel ? null : tone.id)}
+                        onPress={() => { setImageUri(null); setSkinTone(isSel ? null : tone.id); }}
                         activeOpacity={0.8}
                         style={styles.skinItem}
                       >
-                        <View
-                          style={[
-                            styles.skinSwatch,
-                            { backgroundColor: tone.color },
-                            isSel && { borderWidth: 3, borderColor: c.text },
-                          ]}
-                        />
+                        <View style={[
+                          styles.skinSwatch,
+                          { backgroundColor: tone.color },
+                          isSel && { borderWidth: 3, borderColor: c.text },
+                        ]} />
                         <Text style={[styles.skinLabel, { color: isSel ? c.text : c.subtext }]}>{tone.label}</Text>
                       </TouchableOpacity>
                     );
@@ -411,15 +524,21 @@ export default function RegisterScreen() {
                 onPress={() => handleFinish()}
                 disabled={loading}
                 activeOpacity={0.85}
-                style={[styles.primaryBtn, { backgroundColor: c.text }]}
+                style={styles.primaryBtn}
               >
-                {loading
-                  ? <ActivityIndicator color={c.bg} />
-                  : <>
-                      <Text style={[styles.primaryBtnText, { color: c.bg }]}>Create My Wardrobe</Text>
-                      <Ionicons name="checkmark-circle" size={20} color={c.bg} style={{ marginLeft: 8 }} />
-                    </>
-                }
+                <LinearGradient
+                  colors={['#7C3AED', '#4F46E5']}
+                  start={{ x: 0, y: 0 }} end={{ x: 1, y: 0 }}
+                  style={styles.primaryBtnInner}
+                >
+                  {loading
+                    ? <ActivityIndicator color="#FFF" />
+                    : <>
+                        <Text style={styles.primaryBtnText}>Create My Wardrobe</Text>
+                        <Ionicons name="checkmark-circle" size={20} color="#FFF" style={{ marginLeft: 8 }} />
+                      </>
+                  }
+                </LinearGradient>
               </TouchableOpacity>
 
               <TouchableOpacity onPress={() => handleFinish(null)} disabled={loading} style={styles.skipBtn}>
@@ -521,11 +640,12 @@ const styles = StyleSheet.create({
   skinSwatch: { width: 48, height: 48, borderRadius: 24, marginBottom: 8 },
   skinLabel: { fontSize: 11, textAlign: 'center', fontWeight: '600' },
 
-  primaryBtn: {
-    height: 54, borderRadius: 14, flexDirection: 'row',
-    justifyContent: 'center', alignItems: 'center', marginBottom: 16,
+  primaryBtn: { borderRadius: 14, overflow: 'hidden', marginBottom: 16 },
+  primaryBtnInner: {
+    height: 54, flexDirection: 'row',
+    justifyContent: 'center', alignItems: 'center',
   },
-  primaryBtnText: { fontSize: 16, fontWeight: '700' },
+  primaryBtnText: { fontSize: 16, fontWeight: '700', color: '#FFF' },
 
   skipBtn: { alignItems: 'center', paddingVertical: 12, marginBottom: 8 },
   skipText: { fontSize: 14, fontWeight: '600' },
@@ -533,4 +653,40 @@ const styles = StyleSheet.create({
   footer: { flexDirection: 'row', justifyContent: 'center', alignItems: 'center', marginTop: 8 },
   footerText: { fontSize: 14 },
   footerLink: { fontSize: 14, fontWeight: '700' },
+
+  // Face scan (Step 3)
+  faceSection: { alignItems: 'center', marginBottom: 20, gap: 14 },
+  faceRingGrad: {
+    width: FACE_RING + 6, height: FACE_RING + 6, borderRadius: (FACE_RING + 6) / 2,
+    justifyContent: 'center', alignItems: 'center',
+    shadowColor: '#7C3AED', shadowOffset: { width: 0, height: 8 },
+    shadowOpacity: 0.28, shadowRadius: 16, elevation: 10,
+  },
+  faceRingInner: {
+    width: FACE_RING, height: FACE_RING, borderRadius: FACE_RING / 2,
+    overflow: 'hidden', justifyContent: 'center', alignItems: 'center',
+  },
+  facePlaceholder: { flex: 1, width: '100%', justifyContent: 'center', alignItems: 'center' },
+  faceImage: { width: FACE_RING, height: FACE_RING },
+  scanOverlay: {
+    ...StyleSheet.absoluteFillObject,
+    backgroundColor: 'rgba(0,0,0,0.65)',
+    justifyContent: 'center', alignItems: 'center', gap: 10,
+  },
+  scanLabel: { color: '#FFF', fontSize: 13, fontWeight: '600' },
+  detectedBadge: {
+    flexDirection: 'row', alignItems: 'center', gap: 8,
+    borderRadius: 20, paddingHorizontal: 16, paddingVertical: 8,
+  },
+  swatchDot: { width: 16, height: 16, borderRadius: 8, borderWidth: 2, borderColor: 'rgba(255,255,255,0.6)' },
+  detectedBadgeText: { fontSize: 14, fontWeight: '700', color: '#FFF' },
+  cameraChip: {
+    flexDirection: 'row', alignItems: 'center',
+    borderWidth: 1.5, borderRadius: 20,
+    paddingHorizontal: 16, paddingVertical: 8,
+  },
+  cameraChipText: { fontSize: 14, fontWeight: '600' },
+  dividerRow: { flexDirection: 'row', alignItems: 'center', gap: 10, marginBottom: 16 },
+  dividerLine: { flex: 1, height: 1 },
+  dividerText: { fontSize: 12, fontWeight: '500' },
 });
