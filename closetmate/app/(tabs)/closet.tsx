@@ -1,447 +1,661 @@
-import React, { useState, useCallback, useRef, memo } from 'react';
+/**
+ * app/(tabs)/closet.tsx — the closet as a boutique shelf.
+ *
+ *  Closet | Looks
+ *  • Closet: category chips + a dense grid of studio-shot cutouts on pastel tiles.
+ *  • Looks:  the outfits you saved from the stylist, shown as lookboards.
+ */
+import React, { memo, useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import {
-  StyleSheet,
-  View,
-  FlatList,
-  TouchableOpacity,
-  ActivityIndicator,
-  Animated,
-  Dimensions,
-  Text,
-  Pressable,
-  Alert,
-  Vibration,
+  ActivityIndicator, Alert, Animated, Easing, FlatList, Modal, Pressable, RefreshControl,
+  ScrollView, StyleSheet, Text, useWindowDimensions, View,
 } from 'react-native';
 import { SafeAreaView } from 'react-native-safe-area-context';
-import { useFocusEffect, useRouter } from 'expo-router';
+import { useFocusEffect } from 'expo-router';
 import { Ionicons } from '@expo/vector-icons';
+import * as Haptics from 'expo-haptics';
 import { useColorScheme } from '@/hooks/use-color-scheme';
-import { Colors, Spacing, BorderRadius } from '@/constants/theme';
-import { getWardrobeItems, deleteWardrobeItem, WardrobeItem } from '@/src/api/ai';
-import ActionSheetModal from '@/components/ActionSheetModal';
+import { Brand, Elevation, tintFor } from '@/constants/theme';
+import {
+  Look, WardrobeItem, deleteLook, deleteWardrobeItem, getLooks, logWornOutfit, replaceItemImage, studioShot,
+} from '@/src/api/ai';
+import { isCutout, prepareForUpload } from '@/src/api/images';
+import { deleteFiles, saveStudioShot, thumbPathOf } from '@/src/api/studioFiles';
+import { getClosetItems, invalidateCloset, peekCloset, removeFromCloset } from '@/src/state/closetCache';
 import { useAuth } from '@/src/context/AuthContext';
+import ActionSheetModal from '@/components/ActionSheetModal';
+import { ItemCard } from '@/components/ItemCard';
+import { Lookboard, LookPiece } from '@/components/Lookboard';
 
-/** Ensure image_path is always a full displayable URI. */
-function resolveImageUrl(imagePath: string | null | undefined): string {
-  if (!imagePath) return '';
-  // Already a complete URI — data:, file:, or http(s): — pass through as-is
-  if (
-    imagePath.startsWith('data:') ||
-    imagePath.startsWith('file:') ||
-    imagePath.startsWith('http')
-  ) return imagePath;
-  // Legacy server-relative path (e.g. "uploads/processed/abc.png")
-  // These only work when the backend is running. New items no longer use this format.
-  const CLOUD_BASE = 'https://closetmate-ai-801722190488.us-central1.run.app';
-  return `${CLOUD_BASE}/${imagePath.replace(/\\/g, '/')}`;
-}
+const SIDE = 20;
+const GAP = 12;
 
-// ---------------------------------------------------------------------------
-// Constants
-// ---------------------------------------------------------------------------
-const { width } = Dimensions.get('window');
-const H_PAD = 20;
-const GAP = 14;
-const CARD_W = (width - H_PAD * 2 - GAP) / 2;
-const CARD_H = CARD_W * 1.35;
-
-const CATEGORIES = [
-  { key: 'top',         label: 'Tops',        icon: 'shirt-outline' as const },
-  { key: 'bottom',      label: 'Bottoms',     icon: 'filter-outline' as const },
-  { key: 'dress',       label: 'Dresses',     icon: 'body-outline' as const },
-  { key: 'traditional', label: 'Traditional', icon: 'sparkles-outline' as const },
-  { key: 'outerwear',   label: 'Outerwear',   icon: 'umbrella-outline' as const },
-  { key: 'footwear',    label: 'Footwear',    icon: 'footsteps-outline' as const },
-  { key: 'accessory',   label: 'Accessories', icon: 'watch-outline' as const },
-];
-
-// ---------------------------------------------------------------------------
-// Colour-dot helper
-// ---------------------------------------------------------------------------
-const COLOR_MAP: Record<string, string> = {
-  red: '#E53935', coral: '#FF7043', orange: '#FB8C00', mustard: '#F9A825',
-  yellow: '#FDD835', green: '#43A047', olive: '#827717', teal: '#00897B',
-  blue: '#1E88E5', navy: '#1A237E', purple: '#8E24AA', lavender: '#9575CD',
-  pink: '#F06292', white: '#F5F5F5', black: '#212121', gray: '#757575',
-  grey: '#757575', brown: '#6D4C41', beige: '#D7CCC8', cream: '#FFF8E1',
-  charcoal: '#37474F',
+const CATEGORY_LABELS: Record<string, string> = {
+  top: 'Tops',
+  bottom: 'Bottoms',
+  dress: 'Dresses',
+  traditional: 'Traditional',
+  outerwear: 'Outerwear',
+  footwear: 'Footwear',
+  accessory: 'Accessories',
 };
-function resolveColorDot(c: string | null) {
-  if (!c) return null;
-  const l = c.toLowerCase();
-  for (const k of Object.keys(COLOR_MAP)) if (l.includes(k)) return COLOR_MAP[k];
-  return null;
-}
+
+const categoryOf = (item: WardrobeItem) => (item.category ?? '').toLowerCase();
+
+const toPieces = (look: Look): LookPiece[] =>
+  look.items.map((i) => ({
+    id: i.item_id,
+    uri: i.image_path,
+    slot: i.slot,
+    label: [i.primary_color, i.subcategory].filter(Boolean).join(' '),
+  }));
 
 // ---------------------------------------------------------------------------
-// CategoryCard
+// Small pieces
 // ---------------------------------------------------------------------------
-interface CategoryCardProps {
-  label: string;
-  icon: React.ComponentProps<typeof Ionicons>['name'];
-  count: number;
-  previewUri: string | null;
-  isDark: boolean;
-  onPress: () => void;
-}
 
-const CategoryCard = memo(({ label, icon, count, previewUri, isDark, onPress }: CategoryCardProps) => {
-  const scale = useRef(new Animated.Value(1)).current;
-  const imgOpacity = useRef(new Animated.Value(1)).current;
-
-  const onPressIn = () => Animated.spring(scale, { toValue: 0.96, useNativeDriver: true, speed: 30 }).start();
-  const onPressOut = () => Animated.spring(scale, { toValue: 1, useNativeDriver: true, speed: 20 }).start();
-  const onLoad = () => Animated.timing(imgOpacity, { toValue: 1, duration: 300, useNativeDriver: true }).start();
-
-  const ok = !!previewUri && (
-    previewUri.startsWith('data:') || previewUri.startsWith('file:') || previewUri.startsWith('http')
+function Segmented({ value, onChange, dark }: {
+  value: 'closet' | 'looks'; onChange: (v: 'closet' | 'looks') => void; dark: boolean;
+}) {
+  const track = dark ? 'rgba(255,255,255,0.08)' : 'rgba(22,20,26,0.06)';
+  return (
+    <View style={[styles.segTrack, { backgroundColor: track }]} accessibilityRole="tablist">
+      {(['closet', 'looks'] as const).map((key) => {
+        const active = value === key;
+        return (
+          <Pressable
+            key={key}
+            onPress={() => { if (!active) { Haptics.selectionAsync().catch(() => {}); onChange(key); } }}
+            accessibilityRole="tab"
+            accessibilityState={{ selected: active }}
+            style={[styles.segItem, active && { backgroundColor: dark ? Brand.nightCard : '#FFFFFF' }, active && Elevation.card]}
+          >
+            <Text style={[styles.segText, { color: dark ? '#FFF' : Brand.ink, opacity: active ? 1 : 0.62 }]}>
+              {key === 'closet' ? 'Closet' : 'Looks'}
+            </Text>
+          </Pressable>
+        );
+      })}
+    </View>
   );
+}
+
+function Chip({ label, active, onPress, dark }: { label: string; active: boolean; onPress: () => void; dark: boolean }) {
+  return (
+    <Pressable
+      onPress={onPress}
+      hitSlop={{ top: 5, bottom: 5 }}
+      accessibilityRole="button"
+      accessibilityState={{ selected: active }}
+      style={({ pressed }) => [
+        styles.chip,
+        active
+          ? { backgroundColor: dark ? '#FFFFFF' : Brand.ink, borderColor: 'transparent' }
+          : { borderColor: dark ? Brand.hairlineDark : Brand.hairline },
+        { transform: [{ scale: pressed ? 0.96 : 1 }] },
+      ]}
+    >
+      <Text style={[styles.chipText, { color: active ? (dark ? Brand.ink : '#FFFFFF') : dark ? 'rgba(255,255,255,0.75)' : 'rgba(22,20,26,0.7)' }]}>
+        {label}
+      </Text>
+    </Pressable>
+  );
+}
+
+/** Soft pulsing placeholders while the closet loads (a spinner on a blank page feels broken). */
+function SkeletonGrid({ cardWidth, dark }: { cardWidth: number; dark: boolean }) {
+  const pulse = useRef(new Animated.Value(0.45)).current;
+  useEffect(() => {
+    const loop = Animated.loop(Animated.sequence([
+      Animated.timing(pulse, { toValue: 1, duration: 800, easing: Easing.inOut(Easing.ease), useNativeDriver: true }),
+      Animated.timing(pulse, { toValue: 0.45, duration: 800, easing: Easing.inOut(Easing.ease), useNativeDriver: true }),
+    ]));
+    loop.start();
+    return () => loop.stop();
+  }, [pulse]);
 
   return (
-    <Animated.View style={{ transform: [{ scale }] }}>
-      <Pressable
-        onPressIn={onPressIn} onPressOut={onPressOut} onPress={onPress}
-        style={[styles.card, { backgroundColor: isDark ? '#1A1A1A' : '#FFF', width: CARD_W, height: CARD_H, shadowColor: isDark ? '#000' : '#AAA' }]}
-      >
-        {ok ? (
-          <Animated.Image source={{ uri: previewUri! }} style={[StyleSheet.absoluteFillObject, styles.cardImage, { opacity: imgOpacity }]} resizeMode="cover" onLoad={onLoad} />
-        ) : (
-          <View style={[StyleSheet.absoluteFillObject, styles.cardPlaceholder, { backgroundColor: isDark ? '#252525' : '#F5F5F5' }]}>
-            <Ionicons name={icon} size={40} color={isDark ? '#3A3A3A' : '#DCDCDC'} />
-            <Text style={{ fontSize: 10, color: isDark ? '#444' : '#CCC', marginTop: 6, textAlign: 'center', paddingHorizontal: 8 }}>
-              Tap to view · re-add to show photo
-            </Text>
-          </View>
-        )}
-        <View style={styles.labelRow}>
-          <Text style={styles.labelTitle}>{label}</Text>
-          <Text style={styles.labelCount}>{count} item{count !== 1 ? 's' : ''}</Text>
-        </View>
-      </Pressable>
-    </Animated.View>
+    <View
+      style={styles.skeletonWrap}
+      accessible
+      accessibilityLabel="Loading your closet"
+      accessibilityState={{ busy: true }}
+    >
+      {Array.from({ length: 9 }).map((_, i) => (
+        <Animated.View
+          key={i}
+          style={{
+            width: cardWidth, height: Math.round(cardWidth * 1.25), borderRadius: 22, opacity: pulse,
+            backgroundColor: tintFor(`skeleton-${i}`, dark),
+          }}
+        />
+      ))}
+    </View>
   );
-});
-
-// ---------------------------------------------------------------------------
-// DetailCard — with long-press
-// ---------------------------------------------------------------------------
-interface DetailCardProps {
-  item: WardrobeItem;
-  isDark: boolean;
-  onLongPress: (item: WardrobeItem) => void;
 }
 
-const DetailCard = memo(({ item, isDark, onLongPress }: DetailCardProps) => {
-  const scale = useRef(new Animated.Value(1)).current;
-  const opacity = useRef(new Animated.Value(1)).current;
+function EmptyState({ icon, title, body, dark, actionLabel, onAction }: {
+  icon: keyof typeof Ionicons.glyphMap; title: string; body: string; dark: boolean;
+  actionLabel?: string; onAction?: () => void;
+}) {
+  return (
+    <View style={styles.empty}>
+      <View style={[styles.emptyIcon, { backgroundColor: dark ? Brand.accentSoftDark : Brand.accentSoft }]}>
+        <Ionicons name={icon} size={30} color={Brand.accent} />
+      </View>
+      <Text style={[styles.emptyTitle, { color: dark ? '#FFF' : Brand.ink }]}>{title}</Text>
+      <Text style={[styles.emptyBody, { color: dark ? 'rgba(255,255,255,0.6)' : 'rgba(22,20,26,0.55)' }]}>{body}</Text>
+      {actionLabel && onAction && (
+        <Pressable
+          onPress={onAction}
+          accessibilityRole="button"
+          style={({ pressed }) => [
+            styles.emptyAction,
+            { backgroundColor: dark ? '#FFFFFF' : Brand.ink, transform: [{ scale: pressed ? 0.96 : 1 }] },
+          ]}
+        >
+          <Text style={[styles.primaryText, { color: dark ? Brand.ink : '#FFFFFF' }]}>{actionLabel}</Text>
+        </Pressable>
+      )}
+    </View>
+  );
+}
 
-  const uri = resolveImageUrl(item.image_path);
-  const ok = uri.startsWith('http') || uri.startsWith('data:') || uri.startsWith('file:');
-  const colorDot = resolveColorDot(item.primary_color);
+// ---------------------------------------------------------------------------
+// Look detail
+// ---------------------------------------------------------------------------
 
-  const onPressIn = () => Animated.spring(scale, { toValue: 0.96, useNativeDriver: true, speed: 30 }).start();
-  const onPressOut = () => Animated.spring(scale, { toValue: 1, useNativeDriver: true, speed: 20 }).start();
+function LookDetail({ look, userId, dark, onClose, onDelete }: {
+  look: Look | null; userId: string; dark: boolean; onClose: () => void; onDelete: (look: Look) => void;
+}) {
+  const { width } = useWindowDimensions();
+  const [wearing, setWearing] = useState(false);
+  const [worn, setWorn] = useState(false);
+  const pieces = useMemo(() => (look ? toPieces(look) : []), [look]);
 
-  const handleLongPress = () => {
-    Vibration.vibrate(40);
-    onLongPress(item);
+  if (!look) return null;
+  // Modal gutter (16) + card padding (16) on each side.
+  const board = Math.min(width - 64, 380);
+  const ink = dark ? '#FFFFFF' : Brand.ink;
+  const muted = dark ? 'rgba(255,255,255,0.6)' : 'rgba(22,20,26,0.55)';
+
+  const wear = async () => {
+    if (wearing || worn) return;
+    setWearing(true);
+    try {
+      await logWornOutfit(userId, look.items.map((i) => i.item_id));
+      setWorn(true);
+      Haptics.notificationAsync(Haptics.NotificationFeedbackType.Success).catch(() => {});
+    } catch (e) {
+      Alert.alert('Could not log this outfit', e instanceof Error ? e.message : 'Please try again.');
+    } finally {
+      setWearing(false);
+    }
   };
 
   return (
-    <Animated.View style={{ transform: [{ scale }] }}>
-      <Pressable
-        onPressIn={onPressIn}
-        onPressOut={onPressOut}
-        onLongPress={handleLongPress}
-        delayLongPress={380}
-        style={[styles.card, {
-          backgroundColor: isDark ? '#1A1A1A' : '#FFF',
-          width: CARD_W, height: CARD_H,
-          shadowColor: isDark ? '#000' : '#AAA',
-        }]}
-      >
-        {ok ? (
-          <Animated.Image
-            source={{ uri }}
-            style={[styles.cardImage, { opacity }]}
-            resizeMode="cover"
-            onError={(e) => console.warn('[closet] Image load error:', uri, e.nativeEvent.error)}
-          />
-        ) : (
-          <View style={[styles.cardPlaceholder, { backgroundColor: isDark ? '#252525' : '#F5F5F5' }]}>
-            <Ionicons name="image-outline" size={36} color={isDark ? '#3A3A3A' : '#DDD'} />
-            <Text style={{ fontSize: 10, color: isDark ? '#444' : '#CCC', marginTop: 6, textAlign: 'center', paddingHorizontal: 12 }}>
-              Delete &amp; re-add{`\n`}to restore photo
+    <Modal visible transparent animationType="fade" onRequestClose={onClose} statusBarTranslucent>
+      <Pressable style={styles.scrim} onPress={onClose} accessibilityRole="button" accessibilityLabel="Close" />
+      <View style={styles.detailWrap} pointerEvents="box-none">
+        <View style={[styles.detailCard, Elevation.lifted, { backgroundColor: dark ? Brand.nightCard : Brand.ivory }]}>
+          <View style={styles.detailHeader}>
+            <Text style={[styles.detailTitle, { color: ink }]} numberOfLines={1}>
+              {look.name ?? 'Saved look'}
             </Text>
+            <Pressable onPress={onClose} hitSlop={12} accessibilityRole="button" accessibilityLabel="Close">
+              <Ionicons name="close" size={22} color={muted} />
+            </Pressable>
           </View>
-        )}
-
-        {/* Category badge */}
-        {!!(item.subcategory ?? item.category) && (
-          <View style={styles.labelBadge}>
-            <Text style={styles.labelText} numberOfLines={1}>
-              {item.subcategory ?? item.category}
-            </Text>
+          <Lookboard pieces={pieces} width={board} />
+          <Text style={[styles.detailCaption, { color: muted }]} numberOfLines={2}>
+            {look.items.map((i) => [i.primary_color, i.subcategory].filter(Boolean).join(' ')).join(' · ')}
+          </Text>
+          <View style={styles.detailActions}>
+            <Pressable
+              onPress={wear}
+              accessibilityRole="button"
+              style={({ pressed }) => [
+                styles.primary,
+                worn
+                  ? { borderColor: '#30D158', borderWidth: 1 }
+                  : { backgroundColor: dark ? '#FFFFFF' : Brand.ink },
+                { transform: [{ scale: pressed && !worn ? 0.96 : 1 }] },
+              ]}
+            >
+              {wearing
+                ? <ActivityIndicator color={dark ? Brand.ink : '#FFF'} />
+                : <Text style={[styles.primaryText, { color: worn ? '#30D158' : dark ? Brand.ink : '#FFFFFF' }]}>
+                    {worn ? '✓ Logged as worn today' : 'Wear today'}
+                  </Text>}
+            </Pressable>
+            <Pressable
+              onPress={() => onDelete(look)}
+              accessibilityRole="button"
+              accessibilityLabel="Delete this look"
+              style={({ pressed }) => [styles.iconButton, { borderColor: dark ? Brand.hairlineDark : Brand.hairline, transform: [{ scale: pressed ? 0.96 : 1 }] }]}
+            >
+              <Ionicons name="trash-outline" size={19} color="#E5484D" />
+            </Pressable>
           </View>
-        )}
+        </View>
+      </View>
+    </Modal>
+  );
+}
 
-        {/* Colour dot */}
-        {!!colorDot && <View style={[styles.colorDot, { backgroundColor: colorDot }]} />}
-      </Pressable>
-    </Animated.View>
+/** One saved look in the Looks grid. Memoised so a refresh doesn't redraw every lookboard. */
+const LookTile = memo(function LookTile({ look, width, ink, onOpen, onDelete }: {
+  look: Look; width: number; ink: string; onOpen: (look: Look) => void; onDelete: (look: Look) => void;
+}) {
+  const pieces = useMemo(() => toPieces(look), [look]);
+  return (
+    <Pressable
+      onPress={() => onOpen(look)}
+      onLongPress={() => onDelete(look)}
+      delayLongPress={380}
+      accessibilityRole="button"
+      accessibilityLabel={look.name ?? 'Saved look'}
+      accessibilityHint="Opens this look"
+      style={({ pressed }) => [{ width, transform: [{ scale: pressed ? 0.96 : 1 }] }]}
+    >
+      {/* Opaque background so Android draws the elevation shadow. */}
+      <View style={[Elevation.card, { borderRadius: 24, backgroundColor: Brand.paper }]}>
+        <Lookboard pieces={pieces} width={width} />
+      </View>
+      <Text style={[styles.lookName, { color: ink }]} numberOfLines={1}>
+        {look.name ?? `${look.items.length} ${look.items.length === 1 ? 'piece' : 'pieces'}`}
+      </Text>
+    </Pressable>
   );
 });
 
 // ---------------------------------------------------------------------------
-// Main screen
+// Screen
 // ---------------------------------------------------------------------------
+
 export default function ClosetScreen() {
-  const colorScheme = useColorScheme();
-  const isDark = colorScheme === 'dark';
-  const theme = colorScheme ?? 'light';
-  const C = Colors[theme];
-  const router = useRouter();
+  const dark = useColorScheme() === 'dark';
+  const { width } = useWindowDimensions();
   const { user_id } = useAuth();
-  const activeUserId = user_id ?? 'demo_user';
+  const uid = user_id ?? '';
 
-  const [items, setItems] = useState<WardrobeItem[]>([]);
-  const [loading, setLoading] = useState(true);
-  const [error, setError] = useState<string | null>(null);
-  const [selectedCategory, setSelectedCategory] = useState<string | null>(null);
+  const [tab, setTab] = useState<'closet' | 'looks'>('closet');
+  const [filter, setFilter] = useState<string>('all');
 
-  // Action sheet state
+  const [items, setItems] = useState<WardrobeItem[]>(() => peekCloset(uid) ?? []);
+  const [itemsLoading, setItemsLoading] = useState(() => peekCloset(uid) === null);
+  const [itemsError, setItemsError] = useState(false);
+  const [refreshing, setRefreshing] = useState(false);
+
+  const [looks, setLooks] = useState<Look[]>([]);
+  const [looksLoading, setLooksLoading] = useState(true);
+  const [openLook, setOpenLook] = useState<Look | null>(null);
+
   const [activeItem, setActiveItem] = useState<WardrobeItem | null>(null);
   const [sheetVisible, setSheetVisible] = useState(false);
+  // The piece whose old photo is being turned into a studio shot (one at a time).
+  const [upgradingId, setUpgradingId] = useState<string | null>(null);
+  const upgrading = useRef(false);
 
-  useFocusEffect(
-    useCallback(() => {
-      let active = true;
-      setLoading(true);
-      setError(null);
-      getWardrobeItems(activeUserId)
-        .then((data) => { if (active) setItems(data); })
-        .catch(() => { if (active) setError('Could not load wardrobe. Is the backend running?'); })
-        .finally(() => { if (active) setLoading(false); });
-      return () => { active = false; };
-    }, [activeUserId])
-  );
+  const ink = dark ? '#FFFFFF' : Brand.ink;
+  const muted = dark ? 'rgba(255,255,255,0.6)' : 'rgba(22,20,26,0.55)';
 
-  // ── Long-press handler ────────────────────────────────────────────────────
-  const handleLongPress = useCallback((item: WardrobeItem) => {
+  const itemWidth = Math.floor((width - SIDE * 2 - GAP * 2) / 3);
+  const lookWidth = Math.floor((width - SIDE * 2 - GAP) / 2);
+
+  // Every load takes a ticket; a delete takes one too. Only the newest ticket may write state, so a
+  // slow response that started before a delete can't bring the deleted piece back.
+  const itemsTicket = useRef(0);
+  const looksTicket = useRef(0);
+
+  const loadItems = useCallback(async (force = false) => {
+    if (!uid) return;
+    const ticket = ++itemsTicket.current;
+    try {
+      const fetched = await getClosetItems(uid, { force });
+      if (ticket === itemsTicket.current) {
+        setItemsError(false);
+        setItems(fetched);
+      }
+    } catch {
+      if (ticket === itemsTicket.current) setItemsError(true);
+    } finally {
+      setItemsLoading(false);
+    }
+  }, [uid]);
+
+  const loadLooks = useCallback(async () => {
+    if (!uid) return;
+    const ticket = ++looksTicket.current;
+    try {
+      const fetched = await getLooks(uid);
+      if (ticket === looksTicket.current) setLooks(fetched);
+    } catch {
+      // The Looks tab shows its empty state; the closet itself is unaffected.
+    } finally {
+      setLooksLoading(false);
+    }
+  }, [uid]);
+
+  useFocusEffect(useCallback(() => {
+    loadItems();
+    loadLooks();
+  }, [loadItems, loadLooks]));
+
+  const onRefresh = useCallback(async () => {
+    setRefreshing(true);
+    await Promise.all([loadItems(true), loadLooks()]);
+    setRefreshing(false);
+  }, [loadItems, loadLooks]);
+
+  // Chips: only categories that actually have pieces.
+  const chips = useMemo(() => {
+    const counts = new Map<string, number>();
+    for (const item of items) {
+      const key = categoryOf(item) in CATEGORY_LABELS ? categoryOf(item) : 'other';
+      counts.set(key, (counts.get(key) ?? 0) + 1);
+    }
+    const ordered = [...Object.keys(CATEGORY_LABELS), 'other'].filter((k) => counts.has(k));
+    return [
+      { key: 'all', label: `All ${items.length}` },
+      ...ordered.map((k) => ({ key: k, label: `${CATEGORY_LABELS[k] ?? 'Other'} ${counts.get(k)}` })),
+    ];
+  }, [items]);
+
+  const visible = useMemo(() => {
+    if (filter === 'all') return items;
+    return items.filter((i) => {
+      const key = categoryOf(i) in CATEGORY_LABELS ? categoryOf(i) : 'other';
+      return key === filter;
+    });
+  }, [items, filter]);
+
+  // If the chosen category empties out (last piece deleted), fall back to "All".
+  useEffect(() => {
+    if (filter !== 'all' && !chips.some((c) => c.key === filter)) setFilter('all');
+  }, [chips, filter]);
+
+  const deleteItem = useCallback(async (target: WardrobeItem) => {
+    itemsTicket.current += 1;                       // invalidate any load still in flight
+    const index = items.findIndex((i) => i.item_id === target.item_id);
+    setItems((prev) => prev.filter((i) => i.item_id !== target.item_id));   // optimistic
+    try {
+      await deleteWardrobeItem(target.item_id);
+      removeFromCloset(uid, target.item_id);
+      loadLooks();       // looks drop pieces that no longer exist
+    } catch (e) {
+      setItems((prev) => {
+        if (prev.some((i) => i.item_id === target.item_id)) return prev;
+        const next = [...prev];
+        next.splice(Math.min(Math.max(index, 0), next.length), 0, target);   // back where it was
+        return next;
+      });
+      Alert.alert('Delete failed', e instanceof Error ? e.message : String(e));
+    }
+  }, [items, uid, loadLooks]);
+
+  // Deleting a piece also removes it from every saved look, so ask first.
+  const confirmDeleteItem = useCallback(() => {
+    if (!activeItem) return;
+    const target = activeItem;
+    Alert.alert('Delete this piece?', 'It will also disappear from any saved looks that use it.', [
+      { text: 'Cancel', style: 'cancel' },
+      { text: 'Delete', style: 'destructive', onPress: () => { deleteItem(target); } },
+    ]);
+  }, [activeItem, deleteItem]);
+
+  const confirmDeleteLook = useCallback((look: Look) => {
+    Alert.alert('Delete this look?', 'The pieces stay in your closet.', [
+      { text: 'Cancel', style: 'cancel' },
+      {
+        text: 'Delete', style: 'destructive',
+        onPress: async () => {
+          looksTicket.current += 1;                 // a load that started earlier must not resurrect it
+          setOpenLook(null);
+          setLooks((prev) => prev.filter((l) => l.look_id !== look.look_id));
+          try {
+            await deleteLook(look.look_id);
+          } catch (e) {
+            Alert.alert('Could not delete', e instanceof Error ? e.message : 'Please try again.');
+            loadLooks();
+          }
+        },
+      },
+    ]);
+  }, [loadLooks]);
+
+  // Old photos (a white-background JPEG on this device) can be upgraded to a studio shot. It costs
+  // one background-removal unit, so it's an explicit choice per piece, never automatic.
+  const upgradePhoto = useCallback(async (item: WardrobeItem) => {
+    const oldPath = item.image_path;
+    if (!oldPath || upgrading.current) return;
+    upgrading.current = true;
+    setUpgradingId(item.item_id);
+    try {
+      const shot = await studioShot(await prepareForUpload(oldPath));
+      if (!shot.cutoutOk) {
+        Alert.alert('No clean studio shot', 'We couldn’t make out this piece clearly in the photo, so it stays as it is.');
+        return;
+      }
+      const newPath = await saveStudioShot(shot);
+      try {
+        await replaceItemImage(item.item_id, newPath);
+      } catch (e) {
+        deleteFiles([newPath, thumbPathOf(newPath)]);      // nothing points at them
+        throw e;
+      }
+      if (oldPath.includes('/closetmate_images/')) deleteFiles([oldPath]);   // our own copy, now unused
+      invalidateCloset();
+      itemsTicket.current += 1;                            // a load that started earlier has the old path
+      setItems((prev) => prev.map((i) => (i.item_id === item.item_id ? { ...i, image_path: newPath } : i)));
+      loadLooks();                                         // saved looks show the new photo too
+      Haptics.notificationAsync(Haptics.NotificationFeedbackType.Success).catch(() => {});
+    } catch (e) {
+      Alert.alert('Could not make a studio shot', e instanceof Error ? e.message : 'Please try again.');
+    } finally {
+      upgrading.current = false;
+      setUpgradingId(null);
+    }
+  }, [loadLooks]);
+
+  const canUpgrade = !!activeItem?.image_path?.startsWith('file://') && !isCutout(activeItem.image_path);
+  const actions = [
+    ...(canUpgrade && activeItem
+      ? [{ label: 'Make studio shot', onPress: () => { upgradePhoto(activeItem); } }]
+      : []),
+    { label: 'Delete Item', onPress: confirmDeleteItem, destructive: true },
+    { label: 'Cancel', onPress: () => setSheetVisible(false) },
+  ];
+  const sheetTitle = activeItem
+    ? [activeItem.subcategory, activeItem.category].filter(Boolean).join(' · ')
+    : undefined;
+
+  // One stable callback for the whole grid (ItemCard hands back the id), so memoised cards
+  // don't all re-render whenever this screen does.
+  const itemsRef = useRef(items);
+  itemsRef.current = items;
+  const openItemSheet = useCallback((id: string) => {
+    const item = itemsRef.current.find((i) => i.item_id === id);
+    if (!item) return;
+    Haptics.selectionAsync().catch(() => {});
     setActiveItem(item);
     setSheetVisible(true);
   }, []);
 
-  const closeSheet = useCallback(() => {
-    setSheetVisible(false);
-  }, []);
+  const renderItem = useCallback(({ item, index }: { item: WardrobeItem; index: number }) => (
+    <ItemCard
+      id={item.item_id}
+      uri={item.image_path}
+      title={item.subcategory ?? item.category}
+      color={item.primary_color}
+      width={itemWidth}
+      dark={dark}
+      index={index}
+      onPress={openItemSheet}
+      onLongPress={openItemSheet}
+    />
+  ), [itemWidth, dark, openItemSheet]);
 
-  // ── Delete ────────────────────────────────────────────────────────────────
-  const handleDelete = useCallback(async () => {
-    if (!activeItem) return;
-    const id = activeItem.item_id;
-    // Optimistic remove
-    setItems((prev) => prev.filter((i) => i.item_id !== id));
-    try {
-      await deleteWardrobeItem(id);
-    } catch (e) {
-      // Revert on failure
-      setItems((prev) => [activeItem, ...prev]);
-      Alert.alert('Delete failed', e instanceof Error ? e.message : String(e));
-    }
-  }, [activeItem]);
-
-  // ── Edit (navigate to add-item with pre-filled data) ──────────────────────
-  const handleEdit = useCallback(() => {
-    if (!activeItem) return;
-    router.push({
-      pathname: '/add-item',
-      params: {
-        editMode: '1',
-        item_id: activeItem.item_id,
-        imageUri: activeItem.image_path ?? '',
-        category: activeItem.category ?? '',
-        subcategory: activeItem.subcategory ?? '',
-        primary_color: activeItem.primary_color ?? '',
-        material: activeItem.material ?? '',
-        pattern: activeItem.pattern ?? '',
-        formality: activeItem.formality_level ?? '',
-      },
-    });
-  }, [activeItem, router]);
-
-  // ── Actions array ─────────────────────────────────────────────────────────
-  const actions = [
-    { label: 'Edit Item', onPress: handleEdit },
-    { label: 'Delete Item', onPress: handleDelete, destructive: true },
-    { label: 'Cancel', onPress: closeSheet },
-  ];
-
-  // ── Category sections ─────────────────────────────────────────────────────
-  type CategorySection = {
-    key: string;
-    label: string;
-    icon: React.ComponentProps<typeof Ionicons>['name'];
-    count: number;
-    previewUri: string | null;
-  };
-  const categorySections: CategorySection[] = CATEGORIES.map((cat) => {
-    const matched = items.filter((i) => (i.category ?? '').toLowerCase() === cat.key);
-    return { ...cat, count: matched.length, previewUri: resolveImageUrl(matched[0]?.image_path) || null };
-  }).filter((c) => c.count > 0);
-
-  const knownKeys = new Set(CATEGORIES.map((c) => c.key));
-  const otherItems = items.filter((i) => !knownKeys.has((i.category ?? '').toLowerCase()));
-  if (otherItems.length > 0) {
-    categorySections.push({
-      key: 'other', label: 'Other', icon: 'grid-outline',
-      count: otherItems.length, previewUri: resolveImageUrl(otherItems[0]?.image_path) || null,
-    });
-  }
-
-  const detailItems = selectedCategory
-    ? items.filter((i) => (i.category ?? '').toLowerCase() === selectedCategory)
-    : [];
-
-  // Group into row pairs
-  function toPairs<T>(arr: T[]): T[][] {
-    const result: T[][] = [];
-    for (let i = 0; i < arr.length; i += 2) result.push(arr.slice(i, i + 2));
-    return result;
-  }
-
-  const selectedLabel = CATEGORIES.find((c) => c.key === selectedCategory)?.label ?? 'Other';
-  const activeItemLabel = activeItem
-    ? [activeItem.subcategory, activeItem.category].filter(Boolean).join(' · ')
-    : undefined;
+  const renderLook = useCallback(({ item: look }: { item: Look }) => (
+    <LookTile
+      look={look}
+      width={lookWidth}
+      ink={ink}
+      onOpen={setOpenLook}
+      onDelete={confirmDeleteLook}
+    />
+  ), [lookWidth, ink, confirmDeleteLook]);
 
   return (
-    <SafeAreaView style={[styles.safe, { backgroundColor: C.background }]}>
-      {/* ── Header ── */}
+    <SafeAreaView style={[styles.safe, { backgroundColor: dark ? Brand.night : Brand.ivory }]}>
       <View style={styles.header}>
-        {selectedCategory ? (
-          <TouchableOpacity onPress={() => setSelectedCategory(null)} style={styles.backRow}>
-            <Ionicons name="chevron-back" size={22} color={C.text} />
-            <Text style={[styles.headerTitle, { color: C.text }]}>{selectedLabel}</Text>
-          </TouchableOpacity>
-        ) : (
-          <Text style={[styles.headerTitle, { color: C.text }]}>My Closet</Text>
-        )}
-        <Text style={[styles.headerCount, { color: C.textSecondary }]}>
-          {items.length} item{items.length !== 1 ? 's' : ''}
+        <Text style={[styles.title, { color: ink }]} accessibilityRole="header">Closet</Text>
+        <Text style={[styles.subtitle, { color: muted }]}>
+          {items.length} {items.length === 1 ? 'piece' : 'pieces'} · {looks.length} {looks.length === 1 ? 'look' : 'looks'}
         </Text>
       </View>
 
-      {/* ── Body ── */}
-      {loading ? (
-        <View style={styles.centered}>
-          <ActivityIndicator size="large" color={C.tint} />
-          <Text style={[styles.stateText, { color: C.textSecondary }]}>Loading…</Text>
-        </View>
-      ) : error ? (
-        <View style={styles.centered}>
-          <Ionicons name="cloud-offline-outline" size={52} color={isDark ? '#444' : '#DDD'} />
-          <Text style={[styles.stateText, { color: C.textSecondary }]}>{error}</Text>
-        </View>
-      ) : items.length === 0 ? (
-        <View style={styles.centered}>
-          <Ionicons name="shirt-outline" size={72} color={isDark ? '#2A2A2A' : '#E8E8E8'} />
-          <Text style={[styles.emptyTitle, { color: C.text }]}>No items yet</Text>
-          <Text style={[styles.stateText, { color: C.textSecondary }]}>Tap + to add your first piece</Text>
-        </View>
-      ) : selectedCategory ? (
-        /* ── Detail grid ── */
-        <FlatList
-          data={toPairs(detailItems)}
-          keyExtractor={(_, i) => `row-${i}`}
-          contentContainerStyle={styles.grid}
-          showsVerticalScrollIndicator={false}
-          renderItem={({ item: row }) => (
-            <View style={styles.row}>
-              {row.map((item) => (
-                <DetailCard key={item.item_id} item={item} isDark={isDark} onLongPress={handleLongPress} />
-              ))}
-              {row.length === 1 && <View style={{ width: CARD_W }} />}
-            </View>
-          )}
-        />
-      ) : (
-        /* ── Category overview ── */
-        <FlatList
-          data={toPairs(categorySections)}
-          keyExtractor={(_, i) => `cat-row-${i}`}
-          contentContainerStyle={styles.grid}
-          showsVerticalScrollIndicator={false}
-          renderItem={({ item: pair }) => (
-            <View style={styles.row}>
-              {pair.map((cat) => (
-                <CategoryCard
-                  key={cat.key}
-                  label={cat.label}
-                  icon={cat.icon}
-                  count={cat.count}
-                  previewUri={cat.previewUri}
-                  isDark={isDark}
-                  onPress={() => setSelectedCategory(cat.key)}
-                />
-              ))}
-              {pair.length === 1 && <View style={{ width: CARD_W }} />}
-            </View>
-          )}
-        />
-      )}
+      <View style={styles.segmentWrap}>
+        <Segmented value={tab} onChange={setTab} dark={dark} />
+      </View>
 
-      {/* ── Action sheet ── */}
+      {/* Both tabs stay mounted (the idle one is just hidden) so each keeps its scroll position. */}
+      <View style={[styles.pane, tab !== 'closet' && styles.hidden]}>
+        {itemsLoading ? (
+          <SkeletonGrid cardWidth={itemWidth} dark={dark} />
+        ) : itemsError && items.length === 0 ? (
+          <EmptyState
+            icon="cloud-offline-outline"
+            title="Can’t reach your closet"
+            body="Check your connection and try again."
+            dark={dark}
+            actionLabel="Try again"
+            onAction={() => loadItems(true)}
+          />
+        ) : items.length === 0 ? (
+          <EmptyState
+            icon="shirt-outline"
+            title="Your closet is empty"
+            body="Tap + to photograph your first piece. We’ll turn it into a clean studio shot."
+            dark={dark}
+          />
+        ) : (
+          <>
+            <View>
+              <ScrollView
+                horizontal
+                showsHorizontalScrollIndicator={false}
+                contentContainerStyle={styles.chipRow}
+              >
+                {chips.map((c) => (
+                  <Chip key={c.key} label={c.label} active={filter === c.key} dark={dark} onPress={() => setFilter(c.key)} />
+                ))}
+              </ScrollView>
+            </View>
+            <FlatList
+              data={visible}
+              keyExtractor={(i) => i.item_id}
+              renderItem={renderItem}
+              numColumns={3}
+              columnWrapperStyle={styles.gridRow}
+              contentContainerStyle={styles.grid}
+              showsVerticalScrollIndicator={false}
+              initialNumToRender={5}
+              windowSize={7}
+              refreshControl={<RefreshControl refreshing={refreshing} onRefresh={onRefresh} tintColor={muted} />}
+            />
+          </>
+        )}
+      </View>
+
+      <View style={[styles.pane, tab !== 'looks' && styles.hidden]}>
+        {looksLoading ? (
+          <ActivityIndicator style={styles.loading} color={muted} />
+        ) : looks.length === 0 ? (
+          <EmptyState
+            icon="heart-outline"
+            title="No saved looks yet"
+            body="Ask the stylist for an outfit and tap the heart to keep it here."
+            dark={dark}
+          />
+        ) : (
+          <FlatList
+            data={looks}
+            keyExtractor={(l) => l.look_id}
+            numColumns={2}
+            columnWrapperStyle={styles.gridRow}
+            contentContainerStyle={styles.grid}
+            showsVerticalScrollIndicator={false}
+            refreshControl={<RefreshControl refreshing={refreshing} onRefresh={onRefresh} tintColor={muted} />}
+            renderItem={renderLook}
+          />
+        )}
+      </View>
+
+      {upgradingId !== null && (
+        <View style={styles.busy} accessibilityLiveRegion="polite" accessibilityLabel="Creating your studio shot">
+          <ActivityIndicator color="#FFFFFF" size="large" />
+          <Text style={styles.busyText}>Creating your studio shot…</Text>
+        </View>
+      )}
       <ActionSheetModal
         visible={sheetVisible}
-        title={activeItemLabel}
+        title={sheetTitle}
         actions={actions}
-        onClose={closeSheet}
+        onClose={() => setSheetVisible(false)}
+      />
+      <LookDetail
+        key={openLook?.look_id ?? 'none'}
+        look={openLook}
+        userId={uid}
+        dark={dark}
+        onClose={() => setOpenLook(null)}
+        onDelete={confirmDeleteLook}
       />
     </SafeAreaView>
   );
 }
 
-// ---------------------------------------------------------------------------
-// Styles
-// ---------------------------------------------------------------------------
 const styles = StyleSheet.create({
   safe: { flex: 1 },
-  header: {
-    flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center',
-    paddingHorizontal: H_PAD, paddingTop: Spacing.l, paddingBottom: Spacing.m,
+  pane: { flex: 1 },
+  hidden: { display: 'none' },
+  busy: {
+    ...StyleSheet.absoluteFillObject, backgroundColor: 'rgba(0,0,0,0.5)', alignItems: 'center',
+    justifyContent: 'center', gap: 14, zIndex: 50,
   },
-  headerTitle: { fontSize: 28, fontWeight: '700', letterSpacing: -0.5 },
-  headerCount: { fontSize: 13 },
-  backRow: { flexDirection: 'row', alignItems: 'center', gap: 4 },
-  grid: { paddingHorizontal: H_PAD, paddingBottom: 120, gap: GAP },
-  row: { flexDirection: 'row', justifyContent: 'space-between' },
-  card: {
-    borderRadius: 20, overflow: 'hidden',
-    shadowOffset: { width: 0, height: 6 },
-    shadowOpacity: 0.09, shadowRadius: 14, elevation: 4,
+  busyText: { color: '#FFFFFF', fontSize: 15, fontWeight: '600' },
+  header: { paddingHorizontal: SIDE, paddingTop: 12 },
+  title: { fontSize: 34, fontWeight: '800', letterSpacing: -0.9 },
+  subtitle: { fontSize: 13, fontWeight: '500', marginTop: 2 },
+  segmentWrap: { paddingHorizontal: SIDE, paddingTop: 16, paddingBottom: 14 },
+  segTrack: { flexDirection: 'row', borderRadius: 14, padding: 3 },
+  segItem: { flex: 1, alignItems: 'center', justifyContent: 'center', height: 40, borderRadius: 11 },
+  segText: { fontSize: 14, fontWeight: '700' },
+  chipRow: { paddingHorizontal: SIDE, gap: 8, paddingBottom: 14 },
+  chip: {
+    height: 34, paddingHorizontal: 14, borderRadius: 17, borderWidth: 1,
+    alignItems: 'center', justifyContent: 'center',
   },
-  cardImage: { width: '100%', height: '100%' },
-  cardPlaceholder: { flex: 1, justifyContent: 'center', alignItems: 'center' },
-  labelRow: {
-    position: 'absolute', bottom: 0, left: 0, right: 0,
-    paddingHorizontal: 14, paddingVertical: 14,
-    backgroundColor: 'rgba(0,0,0,0.45)', gap: 2,
-  },
-  labelTitle: { fontSize: 15, fontWeight: '700', color: '#FFF', letterSpacing: 0.1 },
-  labelCount: { fontSize: 12, color: 'rgba(255,255,255,0.75)' },
-  labelBadge: {
-    position: 'absolute', top: 10, left: 10,
-    backgroundColor: 'rgba(0,0,0,0.40)',
-    borderRadius: 20, paddingHorizontal: 9, paddingVertical: 3,
-  },
-  labelText: { fontSize: 11, fontWeight: '600', color: '#FFF', textTransform: 'capitalize' },
-  colorDot: {
-    position: 'absolute', bottom: 10, right: 10,
-    width: 12, height: 12, borderRadius: 6,
-    borderWidth: 1.5, borderColor: 'rgba(255,255,255,0.6)',
-  },
-  centered: { flex: 1, justifyContent: 'center', alignItems: 'center', gap: 12, paddingBottom: 80 },
-  emptyTitle: { fontSize: 18, fontWeight: '600', letterSpacing: -0.2 },
-  stateText: { fontSize: 14, textAlign: 'center', paddingHorizontal: 40, lineHeight: 20 },
+  chipText: { fontSize: 13, fontWeight: '600' },
+  grid: { paddingBottom: 126 },
+  gridRow: { gap: GAP, paddingHorizontal: SIDE, marginBottom: 14 },
+  skeletonWrap: { flexDirection: 'row', flexWrap: 'wrap', gap: GAP, paddingHorizontal: SIDE, rowGap: 24 },
+  loading: { marginTop: 60 },
+  lookName: { marginTop: 8, paddingHorizontal: 4, fontSize: 13, fontWeight: '600' },
+  empty: { flex: 1, alignItems: 'center', justifyContent: 'center', paddingHorizontal: 40, paddingBottom: 120 },
+  emptyIcon: { width: 72, height: 72, borderRadius: 36, alignItems: 'center', justifyContent: 'center', marginBottom: 18 },
+  emptyTitle: { fontSize: 20, fontWeight: '700', letterSpacing: -0.3, marginBottom: 6 },
+  emptyBody: { fontSize: 14, lineHeight: 20, textAlign: 'center' },
+  emptyAction: { marginTop: 20, height: 46, paddingHorizontal: 28, borderRadius: 23, alignItems: 'center', justifyContent: 'center' },
+  scrim: { ...StyleSheet.absoluteFillObject, backgroundColor: 'rgba(0,0,0,0.5)' },
+  detailWrap: { flex: 1, alignItems: 'center', justifyContent: 'center', padding: 16 },
+  detailCard: { borderRadius: 32, padding: 16, gap: 12, alignItems: 'center' },
+  detailHeader: { flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between', alignSelf: 'stretch', paddingHorizontal: 4 },
+  detailTitle: { flex: 1, fontSize: 18, fontWeight: '700', letterSpacing: -0.2, marginRight: 12 },
+  detailCaption: { fontSize: 13, lineHeight: 18, textTransform: 'capitalize', textAlign: 'center', alignSelf: 'stretch' },
+  detailActions: { flexDirection: 'row', alignItems: 'center', gap: 10, alignSelf: 'stretch' },
+  primary: { flex: 1, height: 46, borderRadius: 23, alignItems: 'center', justifyContent: 'center' },
+  primaryText: { fontSize: 14, fontWeight: '700' },
+  iconButton: { width: 46, height: 46, borderRadius: 23, borderWidth: 1, alignItems: 'center', justifyContent: 'center' },
 });

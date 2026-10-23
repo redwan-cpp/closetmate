@@ -1,6 +1,7 @@
-import { Tabs, usePathname } from 'expo-router';
+import { Redirect, Tabs, usePathname } from 'expo-router';
 import React from 'react';
 import { Platform, View, StyleSheet } from 'react-native';
+import { useSafeAreaInsets } from 'react-native-safe-area-context';
 
 import { HapticTab } from '@/components/haptic-tab';
 import TabBarBackground from '@/components/ui/TabBarBackground';
@@ -8,6 +9,7 @@ import { Colors } from '@/constants/theme';
 import { useColorScheme } from '@/hooks/use-color-scheme';
 import { Ionicons } from '@expo/vector-icons';
 import { FloatingCameraButton } from '@/components/FloatingCameraButton';
+import { useAuth } from '@/src/context/AuthContext';
 
 // Must match the tabBarStyle heights below
 const TAB_BAR_HEIGHT_IOS = 85;
@@ -18,13 +20,13 @@ const TAB_BAR_HEIGHT = Platform.OS === 'ios' ? TAB_BAR_HEIGHT_IOS : TAB_BAR_HEIG
  * Renders the floating camera button only when the Closet tab is active.
  * Positioned at the bottom-right corner, floating above the tab bar.
  */
-function ClosetCameraButton() {
+function ClosetCameraButton({ bottomInset }: { bottomInset: number }) {
   const pathname = usePathname();
   const isCloset = pathname === '/closet' || pathname.endsWith('/closet');
   if (!isCloset) return null;
 
   return (
-    <View style={styles.cameraButtonWrapper} pointerEvents="box-none">
+    <View style={[styles.cameraButtonWrapper, { bottom: TAB_BAR_HEIGHT + bottomInset + 16 }]} pointerEvents="box-none">
       <FloatingCameraButton />
     </View>
   );
@@ -34,6 +36,15 @@ export default function TabLayout() {
   const colorScheme = useColorScheme();
   const theme = colorScheme ?? 'light';
   const isDark = theme === 'dark';
+  const { token, isLoaded } = useAuth();
+  // Android draws edge to edge, so the gesture bar sits ON TOP of a fixed-height tab bar unless
+  // its inset is added (iOS already budgets for the home indicator in its fixed height).
+  const insets = useSafeAreaInsets();
+  const bottomInset = Platform.OS === 'android' ? insets.bottom : 0;
+
+  // Signed-out users (expired session, deep link, logout) never see the tabs.
+  if (!isLoaded) return null;
+  if (!token) return <Redirect href="/login" />;
 
   return (
     <View style={{ flex: 1 }}>
@@ -58,8 +69,8 @@ export default function TabLayout() {
               shadowRadius: 4,
             },
             default: {
-              height: TAB_BAR_HEIGHT_ANDROID,
-              paddingBottom: 10,
+              height: TAB_BAR_HEIGHT_ANDROID + bottomInset,
+              paddingBottom: 10 + bottomInset,
               paddingTop: 10,
               backgroundColor: isDark ? '#000000' : '#FFFFFF',
               borderTopWidth: 0,
@@ -113,7 +124,7 @@ export default function TabLayout() {
       </Tabs>
 
       {/* Floating camera button — bottom-right, above tab bar, Closet tab only */}
-      <ClosetCameraButton />
+      <ClosetCameraButton bottomInset={bottomInset} />
     </View>
   );
 }

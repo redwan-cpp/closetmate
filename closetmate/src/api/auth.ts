@@ -1,8 +1,13 @@
 /**
  * src/api/auth.ts
- * Auth API layer — register, login, OAuth placeholders, skin-tone upload.
+ * Auth API layer — register, login, refresh/logout, profile, skin-tone scan.
+ *
+ * register / login / skin-tone are called while signed out, so they use plain
+ * fetch. Everything that needs a signed-in user goes through authFetch.
  */
-import { AI_BASE_URL } from './ai';
+import { AI_BASE_URL } from './config';
+import { prepareForUpload } from './images';
+import { authFetch, toApiError } from './session';
 
 // ─────────────────────────────────────────────
 // Types
@@ -22,14 +27,36 @@ export interface RegisterResult {
   user_id: string;
 }
 
+export interface ProfileUpdatePayload {
+  body_shape?: string;
+  /** "light-medium" or "light-medium (warm)" — the backend normalises either form. */
+  skin_tone?: string;
+}
+
 export interface LoginPayload {
   email: string;
   password: string;
 }
 
 export interface LoginResult {
+  /** Short-lived access token (JWT). */
   token: string;
+  refresh_token: string;
+  token_type: string;
+  /** Access-token lifetime in seconds. */
+  expires_in: number;
   user_id: string;
+}
+
+export interface UserProfile {
+  user_id: string;
+  name: string;
+  email: string;
+  gender: string;
+  body_shape: string | null;
+  skin_tone: string | null;
+  style_preference: string | null;
+  created_at: string;
 }
 
 export interface SkinToneResult {
@@ -46,10 +73,11 @@ export interface SkinToneResult {
 // Helpers
 // ─────────────────────────────────────────────
 
-async function post<T>(path: string, body: object): Promise<T> {
+/** POST JSON without credentials (sign-up / sign-in). */
+async function postPublic<T>(path: string, body: object): Promise<T> {
   const url = `${AI_BASE_URL}${path}`;
 
-  // 20-second timeout — Cloud Run may take up to 15s to cold-start
+  // 20 s: Cloud Run can take up to ~15 s to cold-start.
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), 20_000);
 
@@ -62,23 +90,17 @@ async function post<T>(path: string, body: object): Promise<T> {
       signal: controller.signal,
     });
   } catch (e: any) {
-    clearTimeout(timer);
     if (e?.name === 'AbortError') {
       throw new Error(
         'The server is warming up — this can take up to 20 seconds.\nPlease tap the button again to retry.'
       );
     }
-    throw new Error(`Network error: ${e?.message ?? String(e)}`);
+    throw new Error('Could not reach the server. Check your connection and try again.');
   } finally {
     clearTimeout(timer);
   }
 
-  if (!res.ok) {
-    const text = await res.text().catch(() => '');
-    let detail = `HTTP ${res.status}`;
-    try { detail = JSON.parse(text).detail ?? detail; } catch {}
-    throw new Error(detail);
-  }
+  if (!res.ok) throw await toApiError(res, 'Request failed');
   return res.json() as Promise<T>;
 }
 
@@ -86,33 +108,69 @@ async function post<T>(path: string, body: object): Promise<T> {
 // Auth endpoints
 // ─────────────────────────────────────────────
 
-export async function registerUser(payload: RegisterPayload): Promise<RegisterResult> {
-  return post<RegisterResult>('/auth/register', payload);
+export function registerUser(payload: RegisterPayload): Promise<RegisterResult> {
+  return postPublic<RegisterResult>('/auth/register', payload);
 }
 
-export async function loginUser(payload: LoginPayload): Promise<LoginResult> {
-  return post<LoginResult>('/auth/login', payload);
+export function loginUser(payload: LoginPayload): Promise<LoginResult> {
+  return postPublic<LoginResult>('/auth/login', payload);
+}
+
+/** Best-effort server-side revoke of a refresh token. Never throws. */
+export async function logoutServer(refreshToken: string): Promise<void> {
+  try {
+    await fetch(`${AI_BASE_URL}/auth/logout`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ refresh_token: refreshToken }),
+    });
+  } catch {
+    // offline: the token will simply expire
+  }
+}
+
+export async function getProfile(): Promise<UserProfile> {
+  const res = await authFetch(`${AI_BASE_URL}/auth/profile`, { timeoutMs: 20_000 });
+  if (!res.ok) throw await toApiError(res, 'Could not load your profile');
+  return res.json() as Promise<UserProfile>;
+}
+
+export async function updateProfile(payload: ProfileUpdatePayload): Promise<UserProfile> {
+  const res = await authFetch(`${AI_BASE_URL}/auth/profile`, {
+    method: 'PATCH',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(payload),
+    timeoutMs: 20_000,
+  });
+  if (!res.ok) throw await toApiError(res, 'Could not update your profile');
+  return res.json() as Promise<UserProfile>;
 }
 
 // ─────────────────────────────────────────────
-// Skin-tone detection — POST /analyze-skin-tone
+// Skin-tone detection — POST /analyze-skin-tone (public: used before an account exists)
 // ─────────────────────────────────────────────
 
 export async function detectSkinTone(imageUri: string): Promise<SkinToneResult> {
-  const url = `${AI_BASE_URL}/analyze-skin-tone`;
+  // The detector works on a ≤1024 px copy anyway; don't upload a full-resolution selfie.
+  const uploadUri = await prepareForUpload(imageUri, 1280);
   const formData = new FormData();
   formData.append('file', {
-    uri: imageUri,
+    uri: uploadUri,
     name: 'selfie.jpg',
     type: 'image/jpeg',
   } as unknown as Blob);
 
-  const res = await fetch(url, { method: 'POST', body: formData });
-  if (!res.ok) {
-    const text = await res.text().catch(() => '');
-    let detail = `HTTP ${res.status}`;
-    try { detail = JSON.parse(text).detail ?? detail; } catch {}
-    throw new Error(detail);
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), 30_000);
+  try {
+    const res = await fetch(`${AI_BASE_URL}/analyze-skin-tone`, {
+      method: 'POST',
+      body: formData,
+      signal: controller.signal,
+    });
+    if (!res.ok) throw await toApiError(res, 'Skin tone scan failed');
+    return (await res.json()) as SkinToneResult;
+  } finally {
+    clearTimeout(timer);
   }
-  return res.json() as Promise<SkinToneResult>;
 }

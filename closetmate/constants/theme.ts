@@ -55,6 +55,53 @@ export const BorderRadius = {
   round: 9999,
 };
 
+// ─────────────────────────────────────────────────────────────────────────────
+// "Boutique" design tokens used by the closet, lookboards and outfit cards.
+// Warm ivory + ink, soft pastel tiles that make cutouts pop, one violet accent
+// (the same family as the login gradient).
+// ─────────────────────────────────────────────────────────────────────────────
+export const Brand = {
+  ink: '#16141A',
+  ivory: '#FBF8F4',        // screen background (light)
+  paper: '#F6F1EA',        // lookboard "paper" — always light, so garment cutouts stay readable
+  night: '#0F0E12',        // screen background (dark)
+  nightCard: '#1A181E',
+  hairline: 'rgba(22,20,26,0.08)',
+  hairlineDark: 'rgba(255,255,255,0.10)',
+  accent: '#7C3AED',
+  accentSoft: '#EFE9FD',
+  accentSoftDark: '#2A2145',
+  // Pastel tiles. A stable tint per item id keeps the closet colourful without being noisy.
+  tints: ['#F8E6EA', '#ECE6F8', '#F8F0D9', '#E3F1E9', '#E1EDF8', '#F9E9DE'],
+  tintsDark: ['#2B2026', '#241F31', '#2B2820', '#1E2A24', '#1D2631', '#2D2420'],
+};
+
+/** Deterministic pastel tile colour for an item (same item, same tint, every render). */
+export function tintFor(id: string, dark: boolean): string {
+  let hash = 5381;
+  for (let i = 0; i < id.length; i++) hash = ((hash << 5) + hash + id.charCodeAt(i)) | 0;
+  const palette = dark ? Brand.tintsDark : Brand.tints;
+  return palette[Math.abs(hash) % palette.length];
+}
+
+/** Soft, layered elevation (shadows are for depth; borders are for structure). */
+export const Elevation = {
+  card: {
+    shadowColor: '#2A1F3D',
+    shadowOpacity: 0.08,
+    shadowRadius: 18,
+    shadowOffset: { width: 0, height: 8 },
+    elevation: 3,
+  },
+  lifted: {
+    shadowColor: '#2A1F3D',
+    shadowOpacity: 0.16,
+    shadowRadius: 28,
+    shadowOffset: { width: 0, height: 14 },
+    elevation: 8,
+  },
+};
+
 export const Typography = {
   title: {
     fontSize: 32,

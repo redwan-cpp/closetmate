@@ -14,9 +14,13 @@ import {
 } from "react-native";
 import { SafeAreaView } from "react-native-safe-area-context";
 import * as ImagePicker from "expo-image-picker";
-import { useState, useEffect } from "react";
+import { useState, useEffect, useRef } from "react";
 import { useLocalSearchParams, useRouter } from "expo-router";
-import { removeBackground, analyzeClothing, addWardrobeItem } from "@/src/api/ai";
+import { studioShot, analyzeClothing, addWardrobeItem } from "@/src/api/ai";
+import { prepareForUpload } from "@/src/api/images";
+import { saveStudioShot, deleteFiles, thumbPathOf } from "@/src/api/studioFiles";
+import { invalidateCloset } from "@/src/state/closetCache";
+import { Brand } from "@/constants/theme";
 import * as FileSystem from "expo-file-system/legacy";
 import { Ionicons } from "@expo/vector-icons";
 import { useAuth } from "@/src/context/AuthContext";
@@ -28,7 +32,6 @@ import { useAuth } from "@/src/context/AuthContext";
 const { width } = Dimensions.get("window");
 const CAPTURE_SIZE = width - 48;
 const PREVIEW_SIZE = 80;
-const DEMO_USER_ID = "demo_user";
 
 // ---------------------------------------------------------------------------
 // Screen
@@ -40,7 +43,8 @@ export default function AddItemScreen() {
   const colorScheme = useColorScheme();
   const isDark = colorScheme === "dark";
   const { user_id } = useAuth();
-  const activeUserId = user_id ?? 'demo_user';
+  // add-item is only reachable from the signed-in tabs, so user_id is set here.
+  const activeUserId = user_id ?? '';
 
   // ── Image state ───────────────────────────────────────────────────────────
   const [originalUri, setOriginalUri] = useState<string | null>(null);
@@ -55,6 +59,19 @@ export default function AddItemScreen() {
   const [removingBg, setRemovingBg] = useState(false);
   const [analyzing, setAnalyzing] = useState(false);
   const [saving, setSaving] = useState(false);
+  // True once the studio shot (transparent cutout) has replaced the raw photo in the preview.
+  const [studioReady, setStudioReady] = useState(false);
+  // False when the server could not find the garment cleanly (the whole photo was kept).
+  const [cutoutOk, setCutoutOk] = useState(true);
+  // True when no studio shot could be made and the raw photo will be saved instead.
+  const [studioFailed, setStudioFailed] = useState(false);
+
+  // Each processImage run takes a number; if the user retakes, clears or leaves while one is
+  // still talking to the server, its late results must not touch the screen or the files.
+  const runId = useRef(0);
+  // Files written for the photo on screen that haven't been saved to the closet yet.
+  const pendingFiles = useRef<string[]>([]);
+  const savingRef = useRef(false);
 
   // ── Form fields ───────────────────────────────────────────────────────────
   const [category, setCategory] = useState("");
@@ -76,8 +93,6 @@ export default function AddItemScreen() {
   // The app's documentDirectory is permanent storage that React Native can
   // read as a file:// URI with no size or memory issues — unlike base64 data
   // URIs which silently fail to render when they exceed ~1–2 MB.
-  //
-  const IMG_DIR = `${FileSystem.documentDirectory}closetmate_images/`;
 
   /** Copy any URI (file:// or content://) to the persistent document directory. */
   const copyToPersistent = async (srcUri: string): Promise<string> => {
@@ -99,23 +114,31 @@ export default function AddItemScreen() {
     return dest;
   };
 
-  /** Decode a base64 data URI from /remove-bg and write to document directory. */
-  const saveBase64ToPersistent = async (dataUri: string): Promise<string> => {
-    const dir = `${FileSystem.documentDirectory ?? ''}closetmate_images/`;
-    await FileSystem.makeDirectoryAsync(dir, { intermediates: true });
-    const dest = `${dir}item_bg_${Date.now()}.jpg`;
-    // Handle both image/jpeg and image/png MIME types
-    const base64 = dataUri.replace(/^data:image\/[\w+]+;base64,/, '');
-    await FileSystem.writeAsStringAsync(dest, base64, { encoding: FileSystem.EncodingType.Base64 });
-    return dest;
+  // (Studio shots are written by saveStudioShot in src/api/studioFiles.ts.)
+  /** Forget the files of a photo that was never saved to the closet. */
+  const discardPending = () => {
+    deleteFiles(pendingFiles.current);
+    pendingFiles.current = [];
   };
+
+  // Leaving the screen cancels whatever is still running and removes unsaved files.
+  useEffect(() => () => {
+    runId.current += 1;
+    discardPending();
+  }, []);
 
   // Plain async function — no useCallback — so it always closes over fresh
   // helper references and never has stale-closure bugs.
-  // eslint-disable-next-line react-hooks/exhaustive-deps
   const processImage = async (uri: string) => {
+    const run = ++runId.current;
+    const stale = () => run !== runId.current;
+    discardPending();                           // files of the previous, unsaved photo
+
     setRemovingBg(true);
     setAnalyzing(true);
+    setStudioReady(false);
+    setStudioFailed(false);
+    setCutoutOk(true);
     // Show original photo immediately so the screen isn't blank while we work
     setPreviewUri(uri);
     setPersistentImagePath('');
@@ -125,41 +148,62 @@ export default function AddItemScreen() {
     // React Native renders file:// URIs efficiently at any size.
     let persistentFallback = uri; // raw camera URI as last resort
     try {
-      persistentFallback = await copyToPersistent(uri);
-      console.log('[add-item] copied to persistent storage:', persistentFallback);
+      const copied = await copyToPersistent(uri);
+      if (stale()) { deleteFiles([copied]); return; }
+      persistentFallback = copied;
+      pendingFiles.current.push(copied);
       setPreviewUri(persistentFallback);        // upgrade preview to doc-dir copy
       setPersistentImagePath(persistentFallback); // can save now
     } catch (e) {
+      if (stale()) return;
       console.warn('[add-item] copyToPersistent failed, using raw URI:', e);
       setPreviewUri(uri);
       setPersistentImagePath(uri); // still saveable, just not ideal
     }
 
-    // ── STEP 2: Remove background + analyze metadata in parallel ──────────
-    // Give removeBackground a 30-second timeout — Cloud Run cold starts
-    // can take 15–20 s. After timeout we keep the original photo.
-    const bgTimeout = new Promise<never>((_, reject) =>
-      setTimeout(() => reject(new Error('remove-bg timeout')), 30_000)
-    );
+    // ── STEP 2: Studio shot + analyze metadata in parallel ───────────────
+    // Shrink once (≈1600 px JPEG): the server rejects very large images, and this cuts the
+    // upload from several MB to a few hundred KB. The original is still what we keep on-device.
+    // studioShot has its own 60 s timeout (Cloud Run cold starts take 15–20 s); that is the only
+    // timer, so a result is never thrown away after the server has already spent the quota on it.
+    let uploadUri = uri;
+    try {
+      uploadUri = await prepareForUpload(uri);
+    } catch (e) {
+      console.warn('[add-item] could not shrink the photo, uploading as is:', e);
+    }
+    if (stale()) return;
     const [bgResult, analyzeResult] = await Promise.allSettled([
-      Promise.race([removeBackground(uri), bgTimeout]),
-      analyzeClothing(uri),
+      studioShot(uploadUri),
+      analyzeClothing(uploadUri),
     ]);
+    if (stale()) return;
 
-    // ── Background removal ────────────────────────────────────────────────
+    // ── Studio shot ───────────────────────────────────────────────────────
     setRemovingBg(false);
     if (bgResult.status === 'fulfilled') {
       try {
-        // Save the processed PNG to a persistent file (NOT a data URI)
-        const processedPath = await saveBase64ToPersistent(bgResult.value);
+        // Save the studio shot to persistent files (NOT a data URI)
+        const processedPath = await saveStudioShot(bgResult.value);
+        if (stale()) { deleteFiles([processedPath, thumbPathOf(processedPath)]); return; }
+        // The closet only ever shows the studio shot, so the full-size camera copy is dead weight.
+        if (persistentFallback !== uri) {
+          deleteFiles([persistentFallback]);
+          pendingFiles.current = pendingFiles.current.filter((p) => p !== persistentFallback);
+        }
+        pendingFiles.current.push(processedPath, thumbPathOf(processedPath));
         setPreviewUri(processedPath);
-        setPersistentImagePath(processedPath); // upgrade to clean bg-removed image
-        console.log('[add-item] bg removal saved to:', processedPath);
+        setPersistentImagePath(processedPath); // upgrade to the clean studio shot
+        setCutoutOk(bgResult.value.cutoutOk);
+        setStudioReady(true);
       } catch (e) {
+        if (stale()) return;
         console.warn('[add-item] could not save bg result, keeping original:', e);
+        setStudioFailed(true);
       }
     } else {
-      console.warn('[add-item] removeBackground failed (using original):', bgResult.reason);
+      console.warn('[add-item] studio shot failed (using original):', bgResult.reason);
+      setStudioFailed(true);
     }
 
     // ── Analyze autofill ──────────────────────────────────────────────────
@@ -215,6 +259,13 @@ export default function AddItemScreen() {
   };
 
   const clearPreview = () => {
+    runId.current += 1;           // whatever is still running for this photo is now stale
+    discardPending();
+    setRemovingBg(false);
+    setAnalyzing(false);
+    setStudioReady(false);
+    setStudioFailed(false);
+    setCutoutOk(true);
     setOriginalUri(null);
     setPreviewUri(null);
     setPersistentImagePath("");
@@ -229,7 +280,12 @@ export default function AddItemScreen() {
 
   // ── Save ──────────────────────────────────────────────────────────────────
   const handleSave = async () => {
-    if (!canSave) return;
+    if (!canSave || savingRef.current) return;
+    if (!activeUserId) {
+      Alert.alert("Please sign in again", "Your session ended. Sign in and add this piece once more.");
+      return;
+    }
+    savingRef.current = true;     // a fast double tap can arrive before `saving` re-renders
     setSaving(true);
     try {
       await addWardrobeItem({
@@ -245,6 +301,8 @@ export default function AddItemScreen() {
         formality:     style.trim()        || "casual",
         culture:       "global",
       });
+      pendingFiles.current = [];   // saved: these files now belong to the closet
+      invalidateCloset();   // the closet grid and the swap sheet must see the new piece
       Alert.alert("Added! ✓", "Item saved to your closet.", [
         { text: "OK", onPress: () => router.back() },
       ]);
@@ -255,6 +313,7 @@ export default function AddItemScreen() {
         { text: "Cancel", style: "cancel" },
       ]);
     } finally {
+      savingRef.current = false;
       setSaving(false);
     }
   };
@@ -263,7 +322,7 @@ export default function AddItemScreen() {
   const loadingLabel = analyzing
     ? "Analyzing your outfit..."
     : removingBg
-    ? "Removing background..."
+    ? "Creating your studio shot…"
     : "";
 
   const styles = createStyles(isDark);
@@ -277,17 +336,25 @@ export default function AddItemScreen() {
       >
         {/* Top bar */}
         <View style={styles.topBar}>
-          <TouchableOpacity style={styles.topIcon} hitSlop={{ top: 12, bottom: 12, left: 12, right: 12 }}>
-            <Ionicons name="flash-outline" size={26} color={isDark ? "#FFF" : "#000"} />
-          </TouchableOpacity>
-          <TouchableOpacity style={styles.topIcon} hitSlop={{ top: 12, bottom: 12, left: 12, right: 12 }}>
-            <Ionicons name="camera-reverse-outline" size={26} color={isDark ? "#FFF" : "#000"} />
-          </TouchableOpacity>
+          <Text style={styles.topTitle} accessibilityRole="header">Add to your closet</Text>
         </View>
 
         {/* Capture area */}
         <View style={styles.captureWrapper}>
-          <Pressable style={styles.captureArea} onPress={!hasImage ? pickImage : undefined}>
+          <Pressable
+            style={[
+              styles.captureArea,
+              // Once the cutout is ready, show it the way the closet will: on a soft tile.
+              studioReady && {
+                backgroundColor: isDark ? Brand.tintsDark[1] : Brand.tints[1],
+                borderStyle: "solid",
+                borderColor: "transparent",
+              },
+            ]}
+            onPress={!hasImage ? pickImage : undefined}
+            accessibilityRole={!hasImage ? "button" : "image"}
+            accessibilityLabel={!hasImage ? "Take a photo of a clothing item" : "Photo of your clothing item"}
+          >
             {hasImage ? (
               <Image
                 source={{ uri: displayUri ?? undefined }}
@@ -311,6 +378,17 @@ export default function AddItemScreen() {
           </Pressable>
         </View>
 
+        {studioReady && !cutoutOk && (
+          <Text style={styles.cutoutHint}>
+            We couldn’t cut this out cleanly. A plainer background and good light work best — you can retake it.
+          </Text>
+        )}
+        {studioFailed && !loading && hasImage && (
+          <Text style={styles.cutoutHint} accessibilityRole="alert">
+            We couldn’t make a studio shot this time, so your original photo will be used. You can retake it, or add it as it is.
+          </Text>
+        )}
+
         {/* Preview thumbnail */}
         {hasImage && (
           <View style={styles.previewRow}>
@@ -323,7 +401,9 @@ export default function AddItemScreen() {
               <TouchableOpacity
                 style={styles.previewRemove}
                 onPress={clearPreview}
-                hitSlop={{ top: 8, bottom: 8, left: 8, right: 8 }}
+                accessibilityRole="button"
+                accessibilityLabel="Remove this photo"
+                hitSlop={{ top: 12, bottom: 12, left: 12, right: 12 }}
               >
                 <Ionicons name="close" size={20} color={isDark ? "#FFF" : "#000"} />
               </TouchableOpacity>
@@ -450,13 +530,13 @@ function createStyles(isDark: boolean) {
       paddingBottom: 40,
     },
     topBar: {
-      flexDirection: "row",
-      justifyContent: "space-between",
-      alignItems: "center",
       paddingVertical: 16,
     },
-    topIcon: {
-      padding: 4,
+    topTitle: {
+      fontSize: 28,
+      fontWeight: "800",
+      letterSpacing: -0.7,
+      color: isDark ? "#FFF" : "#000",
     },
     captureWrapper: {
       alignItems: "center",
@@ -498,6 +578,14 @@ function createStyles(isDark: boolean) {
       fontSize: 14,
       fontWeight: "500",
       textAlign: "center",
+    },
+    cutoutHint: {
+      fontSize: 13,
+      lineHeight: 18,
+      color: isDark ? "#FFB74D" : "#9A5B00",
+      textAlign: "center",
+      marginBottom: 16,
+      paddingHorizontal: 12,
     },
     previewRow: {
       flexDirection: "row",

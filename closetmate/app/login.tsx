@@ -39,8 +39,12 @@ export default function LoginScreen() {
     }
     setLoading(true);
     try {
-      const { token, user_id } = await loginUser({ email: em, password });
-      await signIn(token, user_id);
+      const tokens = await loginUser({ email: em, password });
+      await signIn({
+        accessToken: tokens.token,
+        refreshToken: tokens.refresh_token,
+        userId: tokens.user_id,
+      });
       router.replace('/(tabs)/stylist');
     } catch (e) {
       Alert.alert('Login failed', e instanceof Error ? e.message : String(e));
@@ -144,7 +148,7 @@ export default function LoginScreen() {
 
           {/* Footer */}
           <View style={styles.footer}>
-            <Text style={[styles.footerText, { color: c.subtext }]}>Don't have an account? </Text>
+            <Text style={[styles.footerText, { color: c.subtext }]}>Don&apos;t have an account?</Text>
             <TouchableOpacity onPress={() => router.push('/register')} activeOpacity={0.7}>
               <Text style={styles.footerLink}>Create one</Text>
             </TouchableOpacity>

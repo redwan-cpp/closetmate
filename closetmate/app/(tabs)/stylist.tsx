@@ -14,6 +14,7 @@
  */
 
 import React, {
+  memo,
   useState,
   useRef,
   useCallback,
@@ -33,8 +34,6 @@ import {
   Easing,
   useColorScheme,
   Dimensions,
-  Image,
-  ScrollView,
   Keyboard,
   Modal,
   Alert,
@@ -47,12 +46,13 @@ import {
   fetchWeather,
   ChatHistoryEntry,
   SuggestedOutfitItem,
+  LookMeta,
   WeatherContext,
   WeatherInfo,
   logWornOutfit,
-  resolveImageUrl,
 } from '@/src/api/ai';
 import { useAuth } from '@/src/context/AuthContext';
+import { LookCard, outfitKey } from '@/components/LookCard';
 
 const { width } = Dimensions.get('window');
 
@@ -67,6 +67,7 @@ interface ChatMessage {
   role: MessageRole;
   text: string;
   outfitItems?: SuggestedOutfitItem[] | null;
+  lookMeta?: LookMeta | null;
   timestamp: Date;
 }
 
@@ -186,76 +187,21 @@ function TypingIndicator({ isDark }: { isDark: boolean }) {
 }
 
 // ─────────────────────────────────────────────
-// Outfit chip — inline item from AI suggestion
-// ─────────────────────────────────────────────
-
-const COLOR_HEX: Record<string, string> = {
-  white: '#F5F5F5', cream: '#FFF8E1', beige: '#D7CCC8', black: '#212121',
-  grey: '#9E9E9E', gray: '#9E9E9E', navy: '#1A237E', blue: '#1E88E5',
-  red: '#E53935', maroon: '#880E4F', green: '#388E3C', olive: '#827717',
-  yellow: '#FDD835', golden: '#F59F00', gold: '#F59F00', orange: '#FB8C00',
-  pink: '#F06292', purple: '#8E24AA', brown: '#6D4C41', teal: '#00897B',
-  mustard: '#F9A825', coral: '#FF7043', lavender: '#9575CD', sky_blue: '#03A9F4',
-};
-
-function OutfitItemCard({ item, isDark }: { item: SuggestedOutfitItem; isDark: boolean }) {
-  const dot = COLOR_HEX[item.color.toLowerCase().replace(' ', '_')] ?? '#AAA';
-  const [imgError, setImgError] = useState(false);
-
-  // Resolve image path — handles file://, https://, and server-relative paths
-  const resolvedUrl = resolveImageUrl(item.image_url);
-
-  if (resolvedUrl && !imgError) {
-    return (
-      <View style={[styles.outfitCard, { backgroundColor: isDark ? '#2C2C2E' : '#E8E8ED' }]}>
-      <Image
-          source={{ uri: resolvedUrl }}
-          style={styles.outfitCardImage}
-          onError={() => setImgError(true)}
-          resizeMode="cover"
-        />
-        <View style={styles.outfitCardMeta}>
-          <View style={[styles.chipDot, { backgroundColor: dot, marginBottom: 2 }]} />
-          <Text
-            style={[styles.outfitCardLabel, { color: isDark ? '#FFF' : '#1C1C1E' }]}
-            numberOfLines={1}
-          >
-            {item.color}
-          </Text>
-          <Text
-            style={[styles.outfitCardSub, { color: isDark ? '#AEAEB2' : '#636366' }]}
-            numberOfLines={1}
-          >
-            {item.subcategory}
-          </Text>
-        </View>
-      </View>
-    );
-  }
-
-  // Fallback: color-dot chip (no image or load error)
-  return (
-    <View style={[styles.chip, { backgroundColor: isDark ? '#2C2C2E' : '#E8E8ED' }]}>
-      <View style={[styles.chipDot, { backgroundColor: dot }]} />
-      <Text style={[styles.chipText, { color: isDark ? '#FFF' : '#1C1C1E' }]}>
-        {item.color} {item.subcategory}
-      </Text>
-    </View>
-  );
-}
-
-// ─────────────────────────────────────────────
 // Single message bubble
 // ─────────────────────────────────────────────
 
 interface BubbleProps {
   msg: ChatMessage;
   isDark: boolean;
-  wornToday: boolean;
-  onWearToday: () => void;
+  userId: string;
+  /** outfitKey() of the outfit logged as worn for this message, if any. */
+  wornKey: string | null;
+  onWearToday: (msgId: string, items: SuggestedOutfitItem[]) => void | Promise<void>;
+  onLookChange: (msgId: string, items: SuggestedOutfitItem[]) => void;
 }
 
-function Bubble({ msg, isDark, wornToday, onWearToday }: BubbleProps) {
+// memo: the screen re-renders on every keystroke, and a LookCard is expensive to redraw.
+const Bubble = memo(function Bubble({ msg, isDark, userId, wornKey, onWearToday, onLookChange }: BubbleProps) {
   if (msg.role === 'user') {
     return (
       <View style={styles.userRow}>
@@ -290,51 +236,20 @@ function Bubble({ msg, isDark, wornToday, onWearToday }: BubbleProps) {
           <Text style={[styles.aiText, { color: isDark ? '#FFF' : '#1C1C1E' }]}>{msg.text}</Text>
         </View>
         {msg.outfitItems && msg.outfitItems.length > 0 && (
-          <View style={styles.chipRow}>
-            <Text style={[styles.chipLabel, { color: isDark ? '#8E8E93' : '#636366' }]}>
-              Suggested outfit ✦
-            </Text>
-            {/* Use horizontal scroll if any item has an image, otherwise wrap chips */}
-            {msg.outfitItems.some(i => i.image_url) ? (
-              <ScrollView
-                horizontal
-                showsHorizontalScrollIndicator={false}
-                contentContainerStyle={styles.outfitCardScroll}
-              >
-                {msg.outfitItems.map((item, i) => (
-                  <OutfitItemCard key={i} item={item} isDark={isDark} />
-                ))}
-              </ScrollView>
-            ) : (
-              <View style={styles.chips}>
-                {msg.outfitItems.map((item, i) => (
-                  <OutfitItemCard key={i} item={item} isDark={isDark} />
-                ))}
-              </View>
-            )}
-            {/* Wear today button */}
-            <TouchableOpacity
-              style={[
-                styles.wearButton,
-                wornToday && styles.wearButtonDone,
-                { borderColor: wornToday ? '#30D158' : isDark ? '#3A3A3C' : '#D1D1D6' },
-              ]}
-              onPress={wornToday ? undefined : onWearToday}
-              activeOpacity={wornToday ? 1 : 0.7}
-            >
-              <Text style={[
-                styles.wearButtonText,
-                { color: wornToday ? '#30D158' : isDark ? '#FFF' : '#1C1C1E' },
-              ]}>
-                {wornToday ? '✓ Logged as worn today' : '👕 Wearing this today'}
-              </Text>
-            </TouchableOpacity>
-          </View>
+          <LookCard
+            items={msg.outfitItems}
+            meta={msg.lookMeta}
+            userId={userId}
+            dark={isDark}
+            wornKey={wornKey}
+            onChange={(items) => onLookChange(msg.id, items)}
+            onWear={(items) => onWearToday(msg.id, items)}
+          />
         )}
       </View>
     </View>
   );
-}
+});
 
 // ─────────────────────────────────────────────
 // Main screen
@@ -348,7 +263,8 @@ export default function StylistScreen() {
   const isDark = colorScheme === 'dark';
   const insets = useSafeAreaInsets();
   const { user_id } = useAuth();
-  const activeUserId = user_id ?? 'demo_user';
+  // The (tabs) layout redirects to /login when signed out, so user_id is set here.
+  const activeUserId = user_id ?? '';
 
   const iosTabBarOffset = Platform.OS === 'ios' ? TAB_BAR_HEIGHT_IOS - insets.bottom : 0;
 
@@ -462,6 +378,7 @@ export default function StylistScreen() {
           role: 'assistant',
           text: result.reply,
           outfitItems: result.suggested_items,
+          lookMeta: result.look_meta,
           timestamp: new Date(),
         };
         setMessages(prev => [...prev, aiMsg]);
@@ -478,7 +395,7 @@ export default function StylistScreen() {
         setIsThinking(false);
       }
     },
-    [isThinking, buildHistory, weatherCtx]
+    [isThinking, buildHistory, weatherCtx, activeUserId]
   );
 
   const handleSend = useCallback(() => sendMessage(inputText), [inputText, sendMessage]);
@@ -492,7 +409,16 @@ export default function StylistScreen() {
   }, [messages.length, scrollToBottom]);
 
   // Track which AI messages have been logged as worn (msgId → true)
-  const [wornTodayMap, setWornTodayMap] = useState<Record<string, boolean>>({});
+  // msgId → outfitKey of the outfit that was logged (so a later swap shows "Wear today" again).
+  const [wornTodayMap, setWornTodayMap] = useState<Record<string, string>>({});
+
+  // A piece was swapped on a card: keep the new outfit in the message, so it survives the list
+  // recycling the card. The colour fact was computed for the original pieces, so drop it.
+  const handleLookChange = useCallback((msgId: string, items: SuggestedOutfitItem[]) => {
+    setMessages(prev => prev.map(m => (m.id === msgId
+      ? { ...m, outfitItems: items, lookMeta: m.lookMeta ? { ...m.lookMeta, palette: null } : m.lookMeta }
+      : m)));
+  }, []);
 
   const handleWearToday = useCallback(async (msgId: string, items: SuggestedOutfitItem[]) => {
     const validIds = items.map(i => i.item_id).filter((id): id is string => !!id);
@@ -505,7 +431,7 @@ export default function StylistScreen() {
     }
     try {
       await logWornOutfit(activeUserId, validIds);
-      setWornTodayMap(prev => ({ ...prev, [msgId]: true }));
+      setWornTodayMap(prev => ({ ...prev, [msgId]: outfitKey(items) }));
     } catch (e) {
       console.warn('[stylist] logWornOutfit failed:', e);
       Alert.alert('Could not save', e instanceof Error ? e.message : String(e));
@@ -630,8 +556,10 @@ export default function StylistScreen() {
                 <Bubble
                   msg={item}
                   isDark={isDark}
-                  wornToday={!!wornTodayMap[item.id]}
-                  onWearToday={() => handleWearToday(item.id, item.outfitItems ?? [])}
+                  userId={activeUserId}
+                  wornKey={wornTodayMap[item.id] ?? null}
+                  onWearToday={handleWearToday}
+                  onLookChange={handleLookChange}
                 />
               </AnimatedMessage>
             )}

@@ -198,7 +198,8 @@ export default function RegisterScreen() {
   const handleStep1Next = () => {
     if (!name.trim()) { Alert.alert('Required', 'Please enter your name.'); return; }
     if (!email.trim()) { Alert.alert('Required', 'Please enter your email.'); return; }
-    if (!password || password.length < 6) { Alert.alert('Weak password', 'Password must be at least 6 characters.'); return; }
+    if (!password || password.length < 8) { Alert.alert('Weak password', 'Password must be at least 8 characters.'); return; }
+    if (password.length > 72) { Alert.alert('Password too long', 'Password must be 72 characters or fewer.'); return; }
     if (password !== confirm) { Alert.alert('Mismatch', 'Passwords do not match.'); return; }
     if (!gender) { Alert.alert('Required', 'Please select your gender.'); return; }
     setStep(2);
@@ -214,7 +215,9 @@ export default function RegisterScreen() {
 
   // ── Final submit ──
   const handleFinish = async (overrideSkin?: string | null) => {
-    const tone = overrideSkin !== undefined ? overrideSkin : skinTone;
+    // A selfie scan sends the full label ("light-medium (warm)") so the undertone is kept;
+    // a manual pick (which clears scanLabel) sends just the band.
+    const tone = overrideSkin !== undefined ? overrideSkin : (scanLabel ?? skinTone);
     setLoading(true);
     try {
       await registerUser({
@@ -225,11 +228,15 @@ export default function RegisterScreen() {
         body_shape: bodyShape ?? undefined,
         skin_tone: tone ?? undefined,
       });
-      const { token, user_id } = await loginUser({
+      const tokens = await loginUser({
         email: email.trim().toLowerCase(),
         password,
       });
-      await signIn(token, user_id);
+      await signIn({
+        accessToken: tokens.token,
+        refreshToken: tokens.refresh_token,
+        userId: tokens.user_id,
+      });
       router.replace('/(tabs)/stylist');
     } catch (e) {
       const msg = e instanceof Error ? e.message : String(e);
@@ -318,7 +325,7 @@ export default function RegisterScreen() {
                   <TextInput
                     style={[styles.input, { color: c.text }]}
                     value={password} onChangeText={setPassword}
-                    placeholder="Min 6 characters" placeholderTextColor={c.placeholder}
+                    placeholder="Min 8 characters" placeholderTextColor={c.placeholder}
                     secureTextEntry={!showPw}
                   />
                 </Field>
@@ -504,7 +511,12 @@ export default function RegisterScreen() {
                     return (
                       <TouchableOpacity
                         key={tone.id}
-                        onPress={() => { setImageUri(null); setSkinTone(isSel ? null : tone.id); }}
+                        onPress={() => {
+                          setImageUri(null);
+                          setScanLabel(null);
+                          setScanHex(null);
+                          setSkinTone(isSel ? null : tone.id);
+                        }}
                         activeOpacity={0.8}
                         style={styles.skinItem}
                       >

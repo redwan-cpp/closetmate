@@ -1,107 +1,61 @@
-import * as FileSystem from "expo-file-system/legacy";
-import Constants from "expo-constants";
-import { Platform } from "react-native";
-
-// ---------------------------------------------------------------------------
-// Network configuration — auto-detect backend from Expo dev server host
-// ---------------------------------------------------------------------------
-//
-// FOR DEVELOPMENT:
-//   When you run `npx expo start`, Expo broadcasts its Metro bundler on your
-//   machine's local LAN IP (e.g. 192.168.1.50:8081).
-//   We grab that same IP and point it at our FastAPI backend on port 8000.
-//
-// FOR PRODUCTION (APK builds):
-//   hostUri is null — we fall back to PRODUCTION_API_URL below.
-//   ⚠️  Set this to your deployed backend URL before building the APK!
-//
-// ---------------------------------------------------------------------------
-
 /**
- * Production backend URL for release builds.
+ * src/api/ai.ts — client for the ClosetMate backend (wardrobe, AI tagging, stylist chat).
  *
- * Priority:
- * 1) EXPO_PUBLIC_API_BASE_URL (EAS env)
- * 2) Cloud Run default URL below
+ * Every call goes through authFetch: it attaches the access token and, on a 401,
+ * refreshes it once and retries. Failures are thrown as ApiError, so the UI can
+ * react to `err.status` / `err.code` ("quota_exceeded", "rate_limited"); the
+ * `err.message` is already user-friendly.
  */
-const PRODUCTION_API_URL =
-  process.env.EXPO_PUBLIC_API_BASE_URL?.trim() ||
-  "https://closetmate-ai-801722190488.us-central1.run.app";
+import { AI_BASE_URL } from './config';
+import { authFetch, AuthFetchInit, toApiError } from './session';
 
-function getBackendUrl(): string {
-  // Step 1: Prefer explicit env/cloud backend in every runtime (Expo Go + APK).
-  if (PRODUCTION_API_URL) {
-    console.log("[ai.ts] Production mode — using:", PRODUCTION_API_URL);
-    return PRODUCTION_API_URL;
-  }
-
-  // Step 2: Expo dev-server host (local backend on your LAN).
-  // This works for physical Android, physical iOS, and simulators in dev mode.
-  const hostUri = Constants.expoConfig?.hostUri;
-  if (hostUri) {
-    const host = hostUri.split(":")[0];
-    const url = `http://${host}:8000`;
-    console.log("[ai.ts] Auto-detected backend URL:", url);
-    return url;
-  }
-
-  // Step 3: Android emulator only (no hostUri available).
-  if (Platform.OS === 'android' && !Constants.isDevice) {
-    console.log("[ai.ts] Android emulator fallback: 10.0.2.2:8000");
-    return "http://10.0.2.2:8000";
-  }
-
-  // Step 4: Last resort safety.
-  console.warn("[ai.ts] Fallback path reached — using production backend URL.");
-  return "https://closetmate-ai-801722190488.us-central1.run.app";
-}
-
-export const AI_BASE_URL = getBackendUrl();
-
-console.log("[ai.ts] AI_BASE_URL =", AI_BASE_URL);
+export { AI_BASE_URL };
 
 // ---------------------------------------------------------------------------
-// Shared image URL resolver
+// Shared helpers
 // ---------------------------------------------------------------------------
 
 /**
  * Resolves any stored image_path to a displayable URI:
- *  - file://...            → device-local path, return as-is
- *  - https://...           → GCS or other URL, return as-is
- *  - uploads/...           → server-relative path, prepend AI_BASE_URL
+ *  - file://... / data:...  → returned as-is
+ *  - https://...            → GCS or other URL, returned as-is
+ *  - uploads/...            → server-relative path, prefixed with the backend URL
  */
 export function resolveImageUrl(path: string | null | undefined): string | null {
   if (!path) return null;
   if (path.startsWith('file://') || path.startsWith('data:')) return path;
   if (path.startsWith('http')) return path;
-  // Server-relative path — prefix with backend base URL
   return `${AI_BASE_URL}/${path.replace(/\\/g, '/').replace(/^\//, '')}`;
-}
-
-// ---------------------------------------------------------------------------
-// Helpers
-// ---------------------------------------------------------------------------
-
-function arrayBufferToBase64(buffer: ArrayBuffer): string {
-  const bytes = new Uint8Array(buffer);
-  let binary = "";
-  const len = bytes.length;
-  for (let i = 0; i < len; i++) {
-    binary += String.fromCharCode(bytes[i]);
-  }
-  return btoa(binary);
 }
 
 /** Build a multipart FormData with a single "file" field from a local URI. */
 function buildImageFormData(uri: string): FormData {
   const formData = new FormData();
-  formData.append("file", {
+  formData.append('file', {
     uri,
-    name: "image.jpg",
-    type: "image/jpeg",
+    name: 'image.jpg',
+    type: 'image/jpeg',
   } as unknown as Blob);
   return formData;
 }
+
+/** authFetch + friendly errors. `label` names the action in error messages. */
+async function request(url: string, init: AuthFetchInit, label: string): Promise<Response> {
+  let res: Response;
+  try {
+    res = await authFetch(url, init);
+  } catch (e) {
+    if (__DEV__) console.warn(`[api] ${label}: request failed`, e);
+    if (e instanceof Error && e.name === 'AbortError') {
+      throw new Error(`${label}: the request timed out. Please try again.`);
+    }
+    throw new Error('Could not reach the server. Check your connection and try again.');
+  }
+  if (!res.ok) throw await toApiError(res, label);
+  return res;
+}
+
+const JSON_HEADERS = { 'Content-Type': 'application/json' };
 
 // ---------------------------------------------------------------------------
 // Types
@@ -140,9 +94,13 @@ export interface AddItemResult {
   item_id: string;
 }
 
+/** Role of a garment in an outfit; assigned by the backend (services/outfit_layout.py). */
+export type Slot = 'outer' | 'dress' | 'top' | 'bottom' | 'shoes' | 'accessory';
+
 export interface WardrobeItem {
   item_id: string;
   user_id: string;
+  slot?: Slot;
   category: string | null;
   subcategory: string | null;
   primary_color: string | null;
@@ -155,354 +113,140 @@ export interface WardrobeItem {
 }
 
 // ---------------------------------------------------------------------------
-// analyzeClothing — POST /upload/analyze-clothing
+// Wardrobe
 // ---------------------------------------------------------------------------
 
-/**
- * Upload an image to the FastAPI analyze-clothing endpoint.
- * Returns suggested metadata (category, color, material, pattern, etc.)
- * Uses MD5 cache — same image returns instantly on subsequent calls.
- */
+/** POST /upload/analyze-clothing — AI-suggested category, colour, material… (counts toward the scan quota). */
 export async function analyzeClothing(uri: string): Promise<AnalyzeClothingResult> {
-  const url = `${AI_BASE_URL}/upload/analyze-clothing`;
-  console.log("[analyzeClothing] Uploading to:", url);
-
-  let response: Response;
-  try {
-    response = await fetch(url, {
-      method: "POST",
-      body: buildImageFormData(uri),
-    });
-  } catch (e) {
-    const msg = e instanceof Error ? e.message : String(e);
-    console.error("[analyzeClothing] Network error:", msg);
-    throw new Error(
-      `Cannot reach backend at ${url}.\n${msg}\n\n` +
-      "On a physical device, set PHYSICAL_DEVICE_IP in src/api/ai.ts to your PC's local IP."
-    );
-  }
-
-  console.log("[analyzeClothing] Response status:", response.status);
-
-  if (!response.ok) {
-    const text = await response.text().catch(() => "");
-    console.error("[analyzeClothing] Backend error:", text);
-    throw new Error(
-      `Analyze failed (HTTP ${response.status})` +
-      (text ? `:\n${text.slice(0, 200)}` : "")
-    );
-  }
-
-  let json: unknown;
-  try {
-    json = await response.json();
-  } catch (e) {
-    throw new Error("Analyze response is not valid JSON");
-  }
-
-  console.log("[analyzeClothing] Result:", JSON.stringify(json).slice(0, 200));
-  return json as AnalyzeClothingResult;
+  const res = await request(
+    `${AI_BASE_URL}/upload/analyze-clothing`,
+    { method: 'POST', body: buildImageFormData(uri), timeoutMs: 60_000 },
+    'Analysis failed'
+  );
+  return (await res.json()) as AnalyzeClothingResult;
 }
 
-// ---------------------------------------------------------------------------
-// addWardrobeItem — POST /wardrobe/add-item
-// ---------------------------------------------------------------------------
-
-/**
- * Save a clothing item to the user's wardrobe.
- * Returns { status: "success", item_id }.
- */
+/** POST /wardrobe/add-item */
 export async function addWardrobeItem(payload: AddItemPayload): Promise<AddItemResult> {
-  const url = `${AI_BASE_URL}/wardrobe/add-item`;
-  console.log("[addWardrobeItem] POST", url, payload);
-
-  let response: Response;
-  try {
-    response = await fetch(url, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(payload),
-    });
-  } catch (e) {
-    const msg = e instanceof Error ? e.message : String(e);
-    throw new Error(`Cannot reach backend at ${url}.\n${msg}`);
-  }
-
-  if (!response.ok) {
-    const text = await response.text().catch(() => "");
-    throw new Error(
-      `Save failed (HTTP ${response.status})` +
-      (text ? `:\n${text.slice(0, 200)}` : "")
-    );
-  }
-
-  const json = await response.json();
-  console.log("[addWardrobeItem] Result:", json);
-  return json as AddItemResult;
+  const res = await request(
+    `${AI_BASE_URL}/wardrobe/add-item`,
+    { method: 'POST', headers: JSON_HEADERS, body: JSON.stringify(payload), timeoutMs: 30_000 },
+    'Save failed'
+  );
+  return (await res.json()) as AddItemResult;
 }
 
-// ---------------------------------------------------------------------------
-// getWardrobeItems — GET /wardrobe/items/{userId}
-// ---------------------------------------------------------------------------
-
-/**
- * Fetch all wardrobe items for a given user.
- */
+/** GET /wardrobe/items/{userId} */
 export async function getWardrobeItems(userId: string): Promise<WardrobeItem[]> {
-  const url = `${AI_BASE_URL}/wardrobe/items/${encodeURIComponent(userId)}`;
-  console.log("[getWardrobeItems] GET", url);
-
-  let response: Response;
-  try {
-    response = await fetch(url);
-  } catch (e) {
-    const msg = e instanceof Error ? e.message : String(e);
-    throw new Error(`Cannot reach backend at ${url}.\n${msg}`);
-  }
-
-  if (!response.ok) {
-    const text = await response.text().catch(() => "");
-    throw new Error(
-      `Fetch wardrobe failed (HTTP ${response.status})` +
-      (text ? `:\n${text.slice(0, 200)}` : "")
-    );
-  }
-
-  const json: WardrobeItem[] = await response.json();
-  // Resolve relative image paths to full URLs so <Image> components can load them
-  const resolved = json.map((item) => ({
-    ...item,
-    image_path: resolveImageUrl(item.image_path),
-  }));
-  console.log("[getWardrobeItems] count:", resolved.length);
-  return resolved;
+  const res = await request(
+    `${AI_BASE_URL}/wardrobe/items/${encodeURIComponent(userId)}?_t=${Date.now()}`,
+    { headers: { 'Cache-Control': 'no-cache' }, timeoutMs: 30_000 },
+    'Could not load your wardrobe'
+  );
+  const items = (await res.json()) as WardrobeItem[];
+  // Resolve relative image paths so <Image> can load them.
+  return items.map((item) => ({ ...item, image_path: resolveImageUrl(item.image_path) }));
 }
 
-// ---------------------------------------------------------------------------
-// deleteWardrobeItem — DELETE /wardrobe/item/{itemId}
-// ---------------------------------------------------------------------------
-
-/**
- * Permanently delete a clothing item by ID.
- */
+/** DELETE /wardrobe/item/{itemId} */
 export async function deleteWardrobeItem(itemId: string): Promise<void> {
-  const url = `${AI_BASE_URL}/wardrobe/item/${encodeURIComponent(itemId)}`;
-  console.log("[deleteWardrobeItem] DELETE", url);
-
-  let response: Response;
-  try {
-    response = await fetch(url, { method: "DELETE" });
-  } catch (e) {
-    const msg = e instanceof Error ? e.message : String(e);
-    throw new Error(`Cannot reach backend at ${url}.\n${msg}`);
-  }
-
-  if (!response.ok) {
-    const text = await response.text().catch(() => "");
-    throw new Error(
-      `Delete failed (HTTP ${response.status})` +
-      (text ? `:\n${text.slice(0, 200)}` : "")
-    );
-  }
-  console.log("[deleteWardrobeItem] Deleted:", itemId);
+  await request(
+    `${AI_BASE_URL}/wardrobe/item/${encodeURIComponent(itemId)}`,
+    { method: 'DELETE', timeoutMs: 30_000 },
+    'Delete failed'
+  );
 }
 
+/** PATCH /wardrobe/item/{itemId}/image — point an item at a new photo (its id, looks and history stay). */
+export async function replaceItemImage(itemId: string, imagePath: string): Promise<void> {
+  await request(
+    `${AI_BASE_URL}/wardrobe/item/${encodeURIComponent(itemId)}/image`,
+    { method: 'PATCH', headers: JSON_HEADERS, body: JSON.stringify({ image_path: imagePath }), timeoutMs: 30_000 },
+    'Could not update the photo'
+  );
+}
 
 // ---------------------------------------------------------------------------
-// removeBackground — calls POST /remove-bg, returns a data: URI (display only)
+// Images
 // ---------------------------------------------------------------------------
 
 /**
- * Upload an image to the FastAPI /remove-bg endpoint and return a
- * displayable `data:image/png;base64,...` URI with the background removed.
- * Used for on-screen preview only — NOT for saving to the wardrobe.
- *
- * @param uri  Local file URI from ImagePicker (file:// or similar)
- * @returns    Data URI string ready for use in <Image source={{ uri }} />
+ * POST /remove-bg — returns a `data:image/jpeg;base64,…` URI with the background
+ * removed. Used for the on-screen preview and saved to the device by the caller.
  */
 export async function removeBackground(uri: string): Promise<string> {
-  const url = `${AI_BASE_URL}/remove-bg`;
-  console.log("[removeBackground] Uploading to:", url);
-
-  let response: Response;
-  try {
-    response = await fetch(url, {
-      method: "POST",
-      body: buildImageFormData(uri),
-    });
-  } catch (e) {
-    const msg = e instanceof Error ? e.message : String(e);
-    console.error("[removeBackground] Network request failed:", msg);
-    throw new Error(
-      `Cannot reach backend at ${url}.\n${msg}\n\n` +
-      "On a physical device, set PHYSICAL_DEVICE_IP in src/api/ai.ts to your PC's local IP."
-    );
-  }
-
-  console.log("[removeBackground] Response status:", response.status);
-
-  if (!response.ok) {
-    const text = await response.text().catch(() => "");
-    console.error("[removeBackground] Backend error body:", text);
-    throw new Error(
-      `Backend returned HTTP ${response.status}` +
-      (text ? `:\n${text.slice(0, 200)}` : "")
-    );
-  }
-
-  let json: unknown;
-  try {
-    json = await response.json();
-  } catch (e) {
-    const msg = e instanceof Error ? e.message : String(e);
-    throw new Error(`Backend response is not valid JSON: ${msg}`);
-  }
-
-  console.log("[removeBackground] JSON keys:", Object.keys(json as object));
-
-  const imageB64 = (json as Record<string, unknown>)["image"];
-
-  if (typeof imageB64 !== "string" || imageB64.length === 0) {
-    console.error("[removeBackground] Empty or missing base64 in response:", json);
-    throw new Error(
-      'Backend JSON does not contain a valid "image" base64 string.'
-    );
-  }
-
-  console.log(
-    "[removeBackground] Received base64 length:",
-    imageB64.length,
-    "chars"
+  const res = await request(
+    `${AI_BASE_URL}/remove-bg`,
+    { method: 'POST', body: buildImageFormData(uri), timeoutMs: 60_000 },
+    'Background removal failed'
   );
-
-  return `data:image/jpeg;base64,${imageB64}`;
+  const json = (await res.json()) as { image?: unknown };
+  if (typeof json.image !== 'string' || json.image.length === 0) {
+    throw new Error('The server returned an empty image. Please try again.');
+  }
+  return `data:image/jpeg;base64,${json.image}`;
 }
 
-// ---------------------------------------------------------------------------
-// uploadClothing — POST /upload/upload-clothing
-// Saves image server-side and returns the server path for DB storage
-// ---------------------------------------------------------------------------
+export interface StudioShotResult {
+  /** `data:image/webp;base64,…` — 640×800, transparent background. */
+  image: string;
+  /** Same picture at 320×400, for grids. */
+  thumb: string;
+  /** False when the cutout looks like it failed (the whole photo was kept). */
+  cutoutOk: boolean;
+}
+
+/**
+ * POST /studio-shot — a clean, centred cutout on a transparent 4:5 canvas, plus a thumbnail.
+ * This is what makes the closet look like a boutique shelf instead of a camera roll.
+ * Counts toward the background-removal quota.
+ */
+export async function studioShot(uri: string): Promise<StudioShotResult> {
+  const res = await request(
+    `${AI_BASE_URL}/studio-shot`,
+    { method: 'POST', body: buildImageFormData(uri), timeoutMs: 60_000 },
+    'Could not prepare this photo'
+  );
+  const json = (await res.json()) as {
+    image?: unknown; thumb?: unknown; mime?: unknown; cutout_ok?: unknown;
+  };
+  if (typeof json.image !== 'string' || typeof json.thumb !== 'string' || !json.image || !json.thumb) {
+    throw new Error('The server returned an empty image. Please try again.');
+  }
+  const mime = typeof json.mime === 'string' ? json.mime : 'image/webp';
+  return {
+    image: `data:${mime};base64,${json.image}`,
+    thumb: `data:${mime};base64,${json.thumb}`,
+    cutoutOk: json.cutout_ok !== false,
+  };
+}
 
 export interface UploadClothingResult {
-  /** Relative server path, e.g. "uploads/processed/abc123.png" */
+  /** Server path or storage URL, e.g. "uploads/processed/abc123.jpg" or "https://storage.googleapis.com/…" */
   image_path: string;
   status: string;
 }
 
 /**
- * Upload an image to /upload/upload-clothing.
- * The backend runs background removal and saves the result to disk.
- * Returns the server-relative path that should be stored in the DB,
- * so the chat endpoint can later serve the image via the /uploads static mount.
+ * POST /upload/upload-clothing — server-side background removal + durable storage
+ * (GCS in production). Not used by the add-item screen yet; it is the path to
+ * photos that survive a reinstall (see the photo-storage phase).
  */
 export async function uploadClothing(uri: string): Promise<UploadClothingResult> {
-  const url = `${AI_BASE_URL}/upload/upload-clothing`;
-  console.log("[uploadClothing] Uploading to:", url);
-
-  let response: Response;
-  try {
-    response = await fetch(url, {
-      method: "POST",
-      body: buildImageFormData(uri),
-    });
-  } catch (e) {
-    const msg = e instanceof Error ? e.message : String(e);
-    console.error("[uploadClothing] Network error:", msg);
-    throw new Error(
-      `Cannot reach backend at ${url}.\n${msg}\n\n` +
-      "On a physical device, set PHYSICAL_DEVICE_IP in src/api/ai.ts to your PC's local IP."
-    );
-  }
-
-  console.log("[uploadClothing] Response status:", response.status);
-
-  if (!response.ok) {
-    const text = await response.text().catch(() => "");
-    console.error("[uploadClothing] Backend error body:", text);
-    throw new Error(
-      `Upload failed (HTTP ${response.status})` +
-      (text ? `:\n${text.slice(0, 200)}` : "")
-    );
-  }
-
-  const json = await response.json();
-  console.log("[uploadClothing] Result:", json);
-  return json as UploadClothingResult;
+  const res = await request(
+    `${AI_BASE_URL}/upload/upload-clothing`,
+    { method: 'POST', body: buildImageFormData(uri), timeoutMs: 60_000 },
+    'Upload failed'
+  );
+  return (await res.json()) as UploadClothingResult;
 }
 
 // ---------------------------------------------------------------------------
-// styleImage — existing full editorial-style pipeline (keep for other uses)
-// ---------------------------------------------------------------------------
-
-/**
- * Upload an image to /style-image. Returns a local file URI or data URI of
- * the editorially-styled result (background replaced with gradient, lighting
- * corrected).
- */
-export async function styleImage(uri: string): Promise<string> {
-  const url = `${AI_BASE_URL}/style-image`;
-  console.log("[styleImage] Uploading to:", url);
-
-  const formData = new FormData();
-  formData.append("file", {
-    uri,
-    name: "image.jpg",
-    type: "image/jpeg",
-  } as unknown as Blob);
-
-  let response: Response;
-  try {
-    response = await fetch(url, {
-      method: "POST",
-      body: formData,
-      headers: {
-        Accept: "image/jpeg",
-      },
-    });
-  } catch (e) {
-    const msg = e instanceof Error ? e.message : String(e);
-    console.error("[styleImage] Network request failed:", msg);
-    throw new Error(
-      `Cannot reach backend at ${url}.\n${msg}\n\n` +
-      "On a physical device, set PHYSICAL_DEVICE_IP in src/api/ai.ts to your PC's local IP."
-    );
-  }
-
-  console.log("[styleImage] Response status:", response.status);
-
-  if (!response.ok) {
-    const text = await response.text().catch(() => "");
-    console.error("[styleImage] Backend error body:", text);
-    throw new Error(
-      `Backend returned HTTP ${response.status}` +
-      (text ? `:\n${text.slice(0, 120)}` : "")
-    );
-  }
-
-  const arrayBuffer = await response.arrayBuffer();
-  const base64 = arrayBufferToBase64(arrayBuffer);
-
-  const dir = FileSystem.documentDirectory ?? FileSystem.cacheDirectory ?? null;
-
-  if (dir) {
-    const fileName = `styled-${Date.now()}.jpg`;
-    const filePath = `${dir}${fileName}`;
-    await FileSystem.writeAsStringAsync(filePath, base64, {
-      encoding: FileSystem.EncodingType.Base64,
-    });
-    console.log("[styleImage] Saved to:", filePath);
-    return filePath;
-  }
-
-  return `data:image/jpeg;base64,${base64}`;
-}
-
-// ---------------------------------------------------------------------------
-// Chat types
+// Stylist chat
 // ---------------------------------------------------------------------------
 
 export interface ChatHistoryEntry {
-  role: "user" | "assistant";
+  role: 'user' | 'assistant';
   content: string;
 }
 
@@ -511,6 +255,20 @@ export interface SuggestedOutfitItem {
   color: string;
   item_id?: string | null;
   image_url?: string | null;
+  category?: string | null;
+  slot?: Slot | null;
+}
+
+/** Facts shown as chips on an outfit card. Only things the backend could actually check. */
+export interface LookMeta {
+  weather?: {
+    city?: string;
+    temperature?: number;
+    condition?: string;
+    condition_icon?: string;
+    environment?: string;
+  } | null;
+  palette?: { matched: number; total: number; tone: string | null; undertone: string | null } | null;
 }
 
 /** Weather context that can be attached to each chat message. */
@@ -518,10 +276,10 @@ export interface WeatherContext {
   city?: string | null;
   lat?: number | null;
   lon?: number | null;
-  environment: "indoor" | "outdoor" | "both";
+  environment: 'indoor' | 'outdoor' | 'both';
 }
 
-/** Weather data returned by GET /chat/weather */
+/** Weather data returned by POST /chat/weather */
 export interface WeatherInfo {
   city: string;
   country: string;
@@ -549,50 +307,33 @@ export interface ChatResponse {
     humidity: number;
     environment: string;
   } | null;
+  look_meta?: LookMeta | null;
 }
 
-// ---------------------------------------------------------------------------
-// fetchWeather — POST /chat/weather
-// ---------------------------------------------------------------------------
-
-/**
- * Fetch real-time weather for a city or coordinates.
- * Call this when the user shares their location; then pass the WeatherContext
- * to subsequent sendChatMessage calls.
- */
+/** POST /chat/weather — real-time weather for a city or coordinates. */
 export async function fetchWeather(
   city?: string | null,
   lat?: number | null,
   lon?: number | null,
-  environment: "indoor" | "outdoor" | "both" = "outdoor"
+  environment: 'indoor' | 'outdoor' | 'both' = 'outdoor'
 ): Promise<WeatherInfo> {
-  const url = `${AI_BASE_URL}/chat/weather`;
-  console.log("[fetchWeather] POST", url);
-
-  const response = await fetch(url, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ city, lat, lon, environment }),
-  });
-
-  if (!response.ok) {
-    const text = await response.text().catch(() => "");
-    throw new Error(
-      `Weather fetch failed (HTTP ${response.status})` +
-        (text ? `:\n${text.slice(0, 200)}` : "")
-    );
-  }
-
-  return response.json() as Promise<WeatherInfo>;
+  const res = await request(
+    `${AI_BASE_URL}/chat/weather`,
+    {
+      method: 'POST',
+      headers: JSON_HEADERS,
+      body: JSON.stringify({ city, lat, lon, environment }),
+      timeoutMs: 20_000,
+    },
+    'Weather fetch failed'
+  );
+  return (await res.json()) as WeatherInfo;
 }
 
-// ---------------------------------------------------------------------------
-// sendChatMessage — POST /chat/message
-// ---------------------------------------------------------------------------
-
 /**
- * Send a message to the ClosetMate AI stylist.
- * Optionally pass weatherContext to enable real-time weather-aware suggestions.
+ * POST /chat/message — ask the AI stylist.
+ * The backend allows ~12 s for OpenAI and ~12 s more for the Gemini fallback,
+ * so the client waits 30 s (it used to give up at 15 s, before the fallback could answer).
  */
 export async function sendChatMessage(
   userId: string,
@@ -600,73 +341,40 @@ export async function sendChatMessage(
   history: ChatHistoryEntry[] = [],
   weatherContext?: WeatherContext | null
 ): Promise<ChatResponse> {
-  const url = `${AI_BASE_URL}/chat/message`;
-  console.log("[sendChatMessage] POST", url);
-
-  const controller = new AbortController();
-  const timeout = setTimeout(() => controller.abort(), 15000);
-
-  let response: Response;
-  try {
-    response = await fetch(url, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        user_id: userId,
-        message,
-        history,
-        weather: weatherContext ?? null,
-      }),
-      signal: controller.signal,
-    });
-  } catch (e) {
-    clearTimeout(timeout);
-    if (e instanceof Error && e.name === "AbortError") {
-      throw new Error("Request timed out after 30s. The AI stylist took too long to respond.");
-    }
-    const msg = e instanceof Error ? e.message : String(e);
-    throw new Error(`Cannot reach backend at ${url}.\n${msg}`);
-  } finally {
-    clearTimeout(timeout);
-  }
-
-  if (!response.ok) {
-    const text = await response.text().catch(() => "");
-    throw new Error(
-      `Chat failed (HTTP ${response.status})` +
-        (text ? `:\n${text.slice(0, 200)}` : "")
-    );
-  }
-
-  const json = await response.json();
-  console.log("[sendChatMessage] reply length:", (json as ChatResponse).reply?.length);
-  return json as ChatResponse;
+  const res = await request(
+    `${AI_BASE_URL}/chat/message`,
+    {
+      method: 'POST',
+      headers: JSON_HEADERS,
+      body: JSON.stringify({ user_id: userId, message, history, weather: weatherContext ?? null }),
+      timeoutMs: 30_000,
+    },
+    'The stylist could not answer'
+  );
+  return (await res.json()) as ChatResponse;
 }
 
-
 // ---------------------------------------------------------------------------
-// logWornOutfit � POST /wardrobe/log-worn
+// Worn history & insights
 // ---------------------------------------------------------------------------
 
+/** POST /wardrobe/log-worn */
 export async function logWornOutfit(userId: string, itemIds: string[]): Promise<void> {
-  const url = `${AI_BASE_URL}/wardrobe/log-worn`;
-  const response = await fetch(url, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ user_id: userId, item_ids: itemIds }),
-  });
-  if (!response.ok) {
-    const txt = await response.text().catch(() => '');
-    throw new Error(`Log worn failed (HTTP ${response.status})${txt ? ': ' + txt.slice(0, 200) : ''}`);
-  }
+  await request(
+    `${AI_BASE_URL}/wardrobe/log-worn`,
+    {
+      method: 'POST',
+      headers: JSON_HEADERS,
+      body: JSON.stringify({ user_id: userId, item_ids: itemIds }),
+      timeoutMs: 20_000,
+    },
+    'Could not log this outfit'
+  );
 }
-
-// ---------------------------------------------------------------------------
-// getWornHistory � GET /wardrobe/worn-history/{userId}
-// ---------------------------------------------------------------------------
 
 export interface WornHistoryItem {
   item_id: string;
+  slot?: Slot;
   image_path: string | null;
   category: string | null;
   subcategory: string | null;
@@ -679,19 +387,92 @@ export interface WornLog {
   items: WornHistoryItem[];
 }
 
+/** GET /wardrobe/worn-history/{userId} */
 export async function getWornHistory(userId: string, limit = 7): Promise<WornLog[]> {
-  const url = `${AI_BASE_URL}/wardrobe/worn-history/${encodeURIComponent(userId)}?limit=${limit}`;
-  const response = await fetch(url);
-  if (!response.ok) {
-    const txt = await response.text().catch(() => '');
-    throw new Error(`Worn history failed (HTTP ${response.status})${txt ? ': ' + txt.slice(0, 200) : ''}`);
-  }
-  const logs: WornLog[] = await response.json();
-  return logs.map(log => ({
-    ...log,
-    items: log.items.map(item => ({
-      ...item,
-      image_path: resolveImageUrl(item.image_path),
-    })),
+  const res = await request(
+    `${AI_BASE_URL}/wardrobe/worn-history/${encodeURIComponent(userId)}?limit=${limit}&_t=${Date.now()}`,
+    { headers: { 'Cache-Control': 'no-cache' }, timeoutMs: 30_000 },
+    'Could not load your worn history'
+  );
+  const logs = (await res.json()) as WornLog[];
+  return logs.map((entry) => ({
+    ...entry,
+    items: entry.items.map((item) => ({ ...item, image_path: resolveImageUrl(item.image_path) })),
   }));
+}
+
+export interface StyleInsights {
+  best_colors: string[];
+  avoid_colors: string[];
+  silhouettes: string[];
+  wardrobe_gaps: string[];
+  general_tip: string;
+}
+
+// ---------------------------------------------------------------------------
+// Saved looks (the "Looks" tab)
+// ---------------------------------------------------------------------------
+
+export interface LookItemData {
+  item_id: string;
+  image_path: string | null;
+  category: string | null;
+  subcategory: string | null;
+  primary_color: string | null;
+  slot: Slot;
+}
+
+export interface Look {
+  look_id: string;
+  name: string | null;
+  created_at: string;
+  items: LookItemData[];
+}
+
+/** POST /wardrobe/looks — keep an outfit. Saving the same set of items twice is a no-op. */
+export async function saveLook(userId: string, itemIds: string[], name?: string): Promise<{ look_id: string; status: string }> {
+  const res = await request(
+    `${AI_BASE_URL}/wardrobe/looks`,
+    {
+      method: 'POST',
+      headers: JSON_HEADERS,
+      body: JSON.stringify({ user_id: userId, item_ids: itemIds, name: name ?? null }),
+      timeoutMs: 20_000,
+    },
+    'Could not save this look'
+  );
+  return (await res.json()) as { look_id: string; status: string };
+}
+
+/** GET /wardrobe/looks/{userId} */
+export async function getLooks(userId: string): Promise<Look[]> {
+  const res = await request(
+    `${AI_BASE_URL}/wardrobe/looks/${encodeURIComponent(userId)}?_t=${Date.now()}`,
+    { headers: { 'Cache-Control': 'no-cache' }, timeoutMs: 30_000 },
+    'Could not load your looks'
+  );
+  const looks = (await res.json()) as Look[];
+  return looks.map((look) => ({
+    ...look,
+    items: look.items.map((item) => ({ ...item, image_path: resolveImageUrl(item.image_path) })),
+  }));
+}
+
+/** DELETE /wardrobe/looks/{lookId} */
+export async function deleteLook(lookId: string): Promise<void> {
+  await request(
+    `${AI_BASE_URL}/wardrobe/looks/${encodeURIComponent(lookId)}`,
+    { method: 'DELETE', timeoutMs: 20_000 },
+    'Could not delete this look'
+  );
+}
+
+/** GET /chat/insights/{userId} (counts toward the insights quota) */
+export async function getStyleInsights(userId: string): Promise<StyleInsights> {
+  const res = await request(
+    `${AI_BASE_URL}/chat/insights/${encodeURIComponent(userId)}?_t=${Date.now()}`,
+    { headers: { 'Cache-Control': 'no-cache' }, timeoutMs: 40_000 },
+    'Could not generate insights'
+  );
+  return (await res.json()) as StyleInsights;
 }
