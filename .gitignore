@@ -18,6 +18,9 @@ closetmate-ai/*.pyc
 closetmate-ai/.env
 closetmate-ai/closetmate.db
 closetmate-ai/uploads/
+closetmate-ai/.coverage
+closetmate-ai/.pytest_cache/
+closetmate-ai/htmlcov/
 
 # ── General ───────────────────────────────────────────
 .DS_Store
