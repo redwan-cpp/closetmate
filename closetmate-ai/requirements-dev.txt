@@ -1,0 +1,6 @@
+-r requirements.txt
+
+# ── Test tooling ──────────────────────────────────────────────────────────────
+pytest
+pytest-cov
+httpx

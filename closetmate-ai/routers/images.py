@@ -1,163 +1,206 @@
 """
-Image processing router: packages app.py endpoints into a FastAPI APIRouter
-so they can be included in main.py under /images/.
+routers/images.py — image utilities: background removal, lighting analysis, styling.
+
+Mounted twice by main.py: under /images/* and at the root (older app builds
+call /remove-bg directly). All endpoints require an access token.
 
 Endpoints:
-  POST /images/analyze-lighting  — lighting analysis
-  POST /images/remove-background — PNG binary output
-  POST /images/remove-bg         — base64 JSON output
-  POST /images/style             — editorial background + garment placement
+  POST /analyze-lighting   brightness / contrast / warmth
+  POST /remove-bg          base64 JPEG on white (what the app uses; quota: bgremove)
+  POST /remove-background  transparent PNG      (quota: bgremove)
+  POST /style              garment on an editorial gradient (quota: bgremove)
 """
 from __future__ import annotations
 
+import asyncio
 import base64
 import io
+import logging
 
-from fastapi import APIRouter, File, HTTPException, UploadFile
+import numpy as np
+from fastapi import APIRouter, Depends, File, HTTPException, UploadFile
 from fastapi.responses import Response
-from PIL import Image
+from PIL import Image, ImageFilter, ImageStat, UnidentifiedImageError
 
-# Use the shared image-processing pipeline (u2netp model, already initialised at startup).
-# This avoids loading a second 170 MB rembg model just for this router.
-from services.image_processing import _process_image_bytes as _remove_bg_bytes
+from quota import metered, release_quota
+from ratelimit import rate_limit_user
+from security import current_user_id
+from services.image_processing import process_image_bytes, remove_background_image
+from services.studio import StudioShotError, make_studio_shot
+from services.uploads import read_upload, require_image_content_type
 
+log = logging.getLogger(__name__)
 router = APIRouter()
 
+_CANVAS = (768, 768)
+
 
 # ---------------------------------------------------------------------------
-# Internal helpers (imported from app.py logic via shared modules,
-# duplicated here to keep app.py fully standalone)
+# Helpers (CPU-bound — always run via asyncio.to_thread)
 # ---------------------------------------------------------------------------
+
+def _open_image(body: bytes) -> Image.Image:
+    try:
+        return Image.open(io.BytesIO(body))
+    except (UnidentifiedImageError, OSError, ValueError) as exc:
+        raise HTTPException(status_code=422, detail="Cannot decode image") from exc
+
 
 def _analyze_lighting(image: Image.Image) -> dict:
-    from PIL import ImageStat
-    import numpy as np
-
     img = image.convert("RGB")
     grayscale = img.convert("L")
-    brightness = ImageStat.Stat(grayscale).mean[0]
-    contrast = ImageStat.Stat(grayscale).stddev[0]
-    np_img = np.array(img)
+    stat = ImageStat.Stat(grayscale)
+    np_img = np.asarray(img)
     warmth = (float(np_img[:, :, 0].mean()) - float(np_img[:, :, 2].mean())) / 255.0
     return {
-        "brightness": round(brightness / 255.0, 3),
-        "contrast": round(min(contrast / 128.0, 1.0), 3),
+        "brightness": round(stat.mean[0] / 255.0, 3),
+        "contrast": round(min(stat.stddev[0] / 128.0, 1.0), 3),
         "warmth": round(warmth, 3),
     }
 
 
-@router.post(
-    "/analyze-lighting",
-    summary="Analyze image lighting: brightness, contrast, warmth",
-)
-async def analyze_lighting_endpoint(file: UploadFile = File(...)) -> dict:
-    if not file.content_type or not file.content_type.startswith("image/"):
-        raise HTTPException(status_code=400, detail="File must be an image")
-    body = await file.read()
-    if not body:
-        raise HTTPException(status_code=400, detail="Empty file")
+def _editorial_background(size=_CANVAS) -> Image.Image:
+    """Soft vertical gradient, built with numpy (the per-pixel Python loop it replaces took ~0.5 s)."""
+    width, height = size
+    ratio = np.linspace(0.0, 1.0, height, dtype=np.float32)
+    rows = (250 * (1 - ratio) + 241 * ratio).astype(np.uint8)
+    arr = np.empty((height, width, 4), dtype=np.uint8)
+    arr[:, :, :3] = rows[:, None, None]
+    arr[:, :, 3] = 255
+    return Image.fromarray(arr, "RGBA")
+
+
+def _style_image(body: bytes) -> bytes:
+    original = _open_image(body).convert("RGBA")
+    foreground = remove_background_image(original)
+
+    canvas = _editorial_background()
+    scale = min(_CANVAS[0] / foreground.width, _CANVAS[1] / foreground.height) * 0.88
+    foreground = foreground.resize(
+        (max(1, int(foreground.width * scale)), max(1, int(foreground.height * scale))),
+        Image.LANCZOS,
+    )
+    x = (_CANVAS[0] - foreground.width) // 2
+    y = int((_CANVAS[1] - foreground.height) * 0.38)
+
+    shadow = Image.new("RGBA", foreground.size, (0, 0, 0, 90)).filter(ImageFilter.GaussianBlur(28))
+    canvas.paste(shadow, (x + 6, y + 18), shadow)
+    canvas.paste(foreground, (x, y), foreground)
+
+    buf = io.BytesIO()
+    canvas.convert("RGB").save(buf, format="JPEG", quality=95)
+    return buf.getvalue()
+
+
+def _remove_background_png(body: bytes) -> bytes:
+    output = remove_background_image(_open_image(body))
+    buf = io.BytesIO()
+    output.save(buf, format="PNG")
+    return buf.getvalue()
+
+
+async def _metered(uid: str, work):
+    """Consume a bgremove unit, run ``work`` in a thread, refund if our side fails."""
     try:
-        image = Image.open(io.BytesIO(body))
-    except Exception as e:
-        raise HTTPException(status_code=422, detail=f"Cannot decode image: {e}") from e
-    return _analyze_lighting(image)
+        async with metered(uid, "bgremove"):
+            return await asyncio.to_thread(work)
+    except HTTPException:
+        raise
+    except Exception:  # noqa: BLE001
+        log.exception("image processing failed")
+        raise HTTPException(status_code=500, detail="Image processing failed. Please try again.")
+
+
+# ---------------------------------------------------------------------------
+# Endpoints
+# ---------------------------------------------------------------------------
+
+@router.post("/analyze-lighting", summary="Analyze image lighting: brightness, contrast, warmth")
+async def analyze_lighting_endpoint(
+    file: UploadFile = File(...),
+    uid: str = Depends(current_user_id),
+    _rate: None = Depends(rate_limit_user("lighting", 30, 60)),
+) -> dict:
+    require_image_content_type(file)
+    body = await read_upload(file)
+    return await asyncio.to_thread(lambda: _analyze_lighting(_open_image(body)))
+
+
+@router.post("/remove-bg", summary="Remove background and return a base64-encoded JPEG")
+async def remove_bg_endpoint(
+    file: UploadFile = File(...),
+    uid: str = Depends(current_user_id),
+    _rate: None = Depends(rate_limit_user("bgremove", 20, 60)),
+) -> dict:
+    require_image_content_type(file)
+    body = await read_upload(file)
+    processed = await _metered(uid, lambda: process_image_bytes(body))
+    return {"image": base64.standard_b64encode(processed).decode("ascii")}
+
+
+class _UnusablePhoto(HTTPException):
+    """A 422 for a photo we could not turn into a studio shot (no garment found, too small…)."""
+
+    def __init__(self, detail: str):
+        super().__init__(status_code=422, detail=detail)
+
+
+def _studio_shot_work(body: bytes) -> dict:
+    try:
+        shot = make_studio_shot(body)
+    except StudioShotError as exc:
+        # The photo is the problem, not us: a clear 422 the app can show as-is.
+        raise _UnusablePhoto(str(exc)) from exc
+    return {
+        "image": base64.standard_b64encode(shot.full).decode("ascii"),
+        "thumb": base64.standard_b64encode(shot.thumb).decode("ascii"),
+        "mime": "image/webp",
+        "width": shot.width,
+        "height": shot.height,
+        "cutout_ok": shot.cutout_ok,
+    }
 
 
 @router.post(
-    "/remove-bg",
-    summary="Remove background and return base64-encoded JPEG",
+    "/studio-shot",
+    summary="Clean cutout on a transparent 4:5 canvas: returns a full image and a thumbnail (WebP, base64)",
 )
-async def remove_bg_endpoint(file: UploadFile = File(...)) -> dict:
-    if not file.content_type or not file.content_type.startswith("image/"):
-        raise HTTPException(status_code=400, detail="File must be an image")
-    body = await file.read()
-    if not body:
-        raise HTTPException(status_code=400, detail="Empty file")
+async def studio_shot_endpoint(
+    file: UploadFile = File(...),
+    uid: str = Depends(current_user_id),
+    _rate: None = Depends(rate_limit_user("bgremove", 20, 60)),
+) -> dict:
+    require_image_content_type(file)
+    body = await read_upload(file)
     try:
-        # _remove_bg_bytes runs rembg (u2netp) + white-background composite.
-        # Returns JPEG bytes — much smaller than PNG for the same visual quality.
-        processed = _remove_bg_bytes(body)
-        b64 = base64.standard_b64encode(processed).decode("ascii")
-        return {"image": b64}
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Background removal failed: {e}") from e
+        return await _metered(uid, lambda: _studio_shot_work(body))
+    except _UnusablePhoto:
+        # Segmentation is local CPU work (no provider was billed), and a photo with no findable
+        # garment is an ordinary thing for a person to try: don't charge them for it. Abuse is
+        # bounded by the per-user rate limit above.
+        await release_quota(uid, "bgremove")
+        raise
 
 
-@router.post(
-    "/remove-background",
-    summary="Remove background and return PNG binary",
-)
-async def remove_background_endpoint(file: UploadFile = File(...)) -> Response:
-    if not file.content_type or not file.content_type.startswith("image/"):
-        raise HTTPException(status_code=400, detail="File must be an image")
-    body = await file.read()
-    if not body:
-        raise HTTPException(status_code=400, detail="Empty file")
-    try:
-        if _rembg_remove is None:
-            raise RuntimeError("rembg unavailable")
-        image = Image.open(io.BytesIO(body))
-        output = _rembg_remove(image, session=_rembg_session)
-        buf = io.BytesIO()
-        output.save(buf, format="PNG")
-        buf.seek(0)
-        return Response(content=buf.read(), media_type="image/png")
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Background removal failed: {e}") from e
+@router.post("/remove-background", summary="Remove background and return a PNG with transparency")
+async def remove_background_endpoint(
+    file: UploadFile = File(...),
+    uid: str = Depends(current_user_id),
+    _rate: None = Depends(rate_limit_user("bgremove", 20, 60)),
+) -> Response:
+    require_image_content_type(file)
+    body = await read_upload(file)
+    png = await _metered(uid, lambda: _remove_background_png(body))
+    return Response(content=png, media_type="image/png")
 
 
-@router.post(
-    "/style",
-    summary="Remove background and place garment on editorial background",
-)
-async def style_image_endpoint(file: UploadFile = File(...)) -> Response:
-    if not file.content_type or not file.content_type.startswith("image/"):
-        raise HTTPException(status_code=400, detail="File must be an image")
-    body = await file.read()
-    if not body:
-        raise HTTPException(status_code=400, detail="Empty file")
-    try:
-        if _rembg_remove is None:
-            raise RuntimeError("rembg unavailable")
-        original = Image.open(io.BytesIO(body)).convert("RGBA")
-
-        # Lighting analysis
-        analysis = _analyze_lighting(original)
-
-        # Remove background
-        foreground = _rembg_remove(original, session=_rembg_session)
-
-        # Create editorial gradient background
-        CANVAS_SIZE = (768, 768)
-        top_color = (250, 250, 250)
-        bottom_color = (241, 241, 241)
-        canvas = Image.new("RGBA", CANVAS_SIZE, top_color)
-        pixels = canvas.load()
-        for y in range(CANVAS_SIZE[1]):
-            ratio = y / CANVAS_SIZE[1]
-            r = int(top_color[0] * (1 - ratio) + bottom_color[0] * ratio)
-            g = int(top_color[1] * (1 - ratio) + bottom_color[1] * ratio)
-            b = int(top_color[2] * (1 - ratio) + bottom_color[2] * ratio)
-            for x in range(CANVAS_SIZE[0]):
-                pixels[x, y] = (r, g, b, 255)
-
-        # Scale and position garment
-        scale = min(CANVAS_SIZE[0] / foreground.width, CANVAS_SIZE[1] / foreground.height) * 0.88
-        new_size = (int(foreground.width * scale), int(foreground.height * scale))
-        foreground = foreground.resize(new_size, Image.LANCZOS)
-        x = (CANVAS_SIZE[0] - foreground.width) // 2
-        y = int((CANVAS_SIZE[1] - foreground.height) * 0.38)
-
-        # Ambient shadow
-        shadow = Image.new("RGBA", foreground.size, (0, 0, 0, 90))
-        shadow = shadow.filter(ImageFilter.GaussianBlur(28))
-        canvas.paste(shadow, (x + 6, y + 18), shadow)
-        canvas.paste(foreground, (x, y), foreground)
-
-        # Output as JPEG
-        buf = io.BytesIO()
-        canvas.convert("RGB").save(buf, format="JPEG", quality=95)
-        buf.seek(0)
-        return Response(content=buf.read(), media_type="image/jpeg")
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Style image failed: {e}") from e
+@router.post("/style", summary="Remove background and place the garment on an editorial background")
+async def style_image_endpoint(
+    file: UploadFile = File(...),
+    uid: str = Depends(current_user_id),
+    _rate: None = Depends(rate_limit_user("bgremove", 20, 60)),
+) -> Response:
+    require_image_content_type(file)
+    body = await read_upload(file)
+    jpeg = await _metered(uid, lambda: _style_image(body))
+    return Response(content=jpeg, media_type="image/jpeg")

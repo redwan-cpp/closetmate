@@ -22,17 +22,21 @@ import json
 import logging
 import os
 import pathlib
+import time
 from functools import lru_cache
 from typing import Optional
 
 import numpy as np
 import requests as _requests
 from PIL import Image
-from rembg import remove, new_session as _new_session
 
-_rembg_session = _new_session("u2net_cloth_seg")
-
+# One background-removal model for the whole app (loaded lazily in image_processing).
+# This module used to load a second, ~170 MB "u2net_cloth_seg" model at import time.
+from quota import mark_billed
+from services.ai_usage import error_label, log_ai_usage
 from services.clothing_classifier import classifier as _hybrid_classifier
+from services.image_processing import remove_background_image
+from settings import get_secret, get_settings
 
 log = logging.getLogger(__name__)
 
@@ -72,49 +76,19 @@ def _cache_set(key: str, value: dict) -> None:
 # ---------------------------------------------------------------------------
 
 def _load_env_key(key: str) -> Optional[str]:
-    val = os.getenv(key)
-    if val:
-        return val
-    try:
-        from dotenv import load_dotenv
-        env_path = pathlib.Path(__file__).parent.parent / ".env"
-        load_dotenv(dotenv_path=env_path, override=True)
-        val = os.getenv(key)
-        if val:
-            return val
-    except Exception:
-        pass
-    env_path = pathlib.Path(__file__).parent.parent / ".env"
-    if env_path.exists():
-        try:
-            for line in env_path.read_text(encoding="utf-8").splitlines():
-                line = line.strip()
-                if not line or line.startswith("#") or "=" not in line:
-                    continue
-                k, _, v = line.partition("=")
-                v = v.strip().strip('"').strip("'")
-                if k.strip() == key:
-                    os.environ[key] = v
-                    return v
-        except Exception:
-            pass
-    return None
+    # Secrets come from the process environment only (main.py loads .env once at startup).
+    # The old version re-read .env on every miss, which could resurrect a key an operator
+    # had deliberately blanked and wrote values into os.environ behind settings' back.
+    return get_secret(key)
 
 
 # ---------------------------------------------------------------------------
 # Gemini REST — fallback visual-detail extractor (pattern / color / formality)
 # ---------------------------------------------------------------------------
 
-_GEMINI_ENDPOINTS = [
-    ("gemini-2.0-flash",
-     "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent"),
-    ("gemini-2.0-flash-lite",
-     "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash-lite:generateContent"),
-    ("gemini-1.5-flash",
-     "https://generativelanguage.googleapis.com/v1/models/gemini-1.5-flash:generateContent"),
-    ("gemini-1.5-flash-8b",
-     "https://generativelanguage.googleapis.com/v1/models/gemini-1.5-flash-8b:generateContent"),
-]
+# Model IDs come from settings.gemini_models (GEMINI_MODELS env var). The hard-coded
+# 2.0 / 1.5 IDs that used to live here were retired by Google in 2026.
+_GEMINI_URL = "https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
 
 _GEMINI_DETAILS_PROMPT = """\
 You are an expert fashion analyst. Look at this clothing image and return a single JSON object with EXACTLY these three keys:
@@ -129,7 +103,7 @@ You are an expert fashion analyst. Look at this clothing image and return a sing
 Return ONLY the JSON object. No markdown, no explanation."""
 
 
-def _gemini_get_details_sync(image_bytes: bytes) -> Optional[dict]:
+def _gemini_get_details_sync(image_bytes: bytes, user_id: Optional[str] = None) -> Optional[dict]:
     api_key = _load_env_key("GEMINI_API_KEY")
     if not api_key:
         log.warning("GEMINI_API_KEY not set — skipping Gemini refinement")
@@ -158,17 +132,36 @@ def _gemini_get_details_sync(image_bytes: bytes) -> Optional[dict]:
         },
     }
 
-    for model_id, url in _GEMINI_ENDPOINTS:
+    for model_id in get_settings().gemini_models:
+        url = _GEMINI_URL.format(model=model_id)
+        generation_config = payload["generationConfig"]
+        if "2.5" in model_id:
+            # Thinking tokens would otherwise eat the tiny output budget.
+            generation_config["thinkingConfig"] = {"thinkingBudget": 0}
+        else:
+            generation_config.pop("thinkingConfig", None)
+        started = time.perf_counter()
         try:
-            resp = _requests.post(url, params={"key": api_key}, json=payload, timeout=30)
-            if resp.status_code == 429:
-                log.warning("Gemini quota exceeded for %s — trying next...", model_id)
-                continue
+            # Key in a header, not the query string, so it never lands in URL logs.
+            resp = _requests.post(url, headers={"x-goog-api-key": api_key}, json=payload, timeout=30)
             if resp.status_code != 200:
-                log.error("Gemini %s HTTP %d: %.300s", model_id, resp.status_code, resp.text)
+                log.warning("Gemini %s returned HTTP %d — trying next model", model_id, resp.status_code)
+                log_ai_usage(
+                    user_id=user_id, feature="vision_fallback", provider="gemini", model=model_id,
+                    latency_ms=int((time.perf_counter() - started) * 1000),
+                    ok=False, error=f"HTTP {resp.status_code}",
+                )
                 continue
 
             data = resp.json()
+            meta = data.get("usageMetadata") or {}
+            log_ai_usage(
+                user_id=user_id, feature="vision_fallback", provider="gemini", model=model_id,
+                input_tokens=meta.get("promptTokenCount"),
+                output_tokens=meta.get("candidatesTokenCount"),
+                latency_ms=int((time.perf_counter() - started) * 1000), ok=True,
+            )
+            mark_billed()
             text = data["candidates"][0]["content"]["parts"][0]["text"].strip()
             if text.startswith("```"):
                 lines = text.split("\n")
@@ -298,7 +291,7 @@ def _dominant_color_from_rgba(rembg_img: Image.Image, orig_img: Image.Image) -> 
 # OpenAI primary path — with in-process deduplication cache
 # ---------------------------------------------------------------------------
 
-def _openai_full_metadata_sync(image_bytes: bytes) -> Optional[dict]:
+def _openai_full_metadata_sync(image_bytes: bytes, user_id: Optional[str] = None) -> Optional[dict]:
     """
     Call OpenAI Vision for the given image bytes.
     Results are cached by MD5 hash — the API is called AT MOST ONCE per image
@@ -322,9 +315,8 @@ def _openai_full_metadata_sync(image_bytes: bytes) -> Optional[dict]:
         return None
 
     log.info("Using OpenAI Vision (cache miss, hash=%s)", img_hash[:8])
-    print("Using OpenAI Vision")
 
-    result = analyze_clothing_with_openai(b64)
+    result = analyze_clothing_with_openai(b64, user_id=user_id)
 
     if result:
         _cache_set(img_hash, result)
@@ -341,7 +333,7 @@ def _openai_full_metadata_sync(image_bytes: bytes) -> Optional[dict]:
 # Public API
 # ---------------------------------------------------------------------------
 
-async def extract_clothing_metadata(image_bytes: bytes) -> dict:
+async def extract_clothing_metadata(image_bytes: bytes, user_id: Optional[str] = None) -> dict:
     """
     Full extraction pipeline (async-friendly).
 
@@ -355,7 +347,7 @@ async def extract_clothing_metadata(image_bytes: bytes) -> dict:
                  Weak/missing AI fields are filled with "unknown".
     """
     # ── PRIMARY: OpenAI Vision ───────────────────────────────────────────────
-    openai_result = await asyncio.to_thread(_openai_full_metadata_sync, image_bytes)
+    openai_result = await asyncio.to_thread(_openai_full_metadata_sync, image_bytes, user_id)
 
     if openai_result:
         # Validate: all 7 fields must have a meaningful value
@@ -384,7 +376,6 @@ async def extract_clothing_metadata(image_bytes: bytes) -> dict:
 
     # ── FALLBACK: Hybrid CV + Gemini ─────────────────────────────────────────
     log.warning("Falling back to local CV")
-    print("Falling back to local CV")
 
     original_img: Optional[Image.Image] = None
     try:
@@ -394,16 +385,16 @@ async def extract_clothing_metadata(image_bytes: bytes) -> dict:
 
     # Run hybrid classifier and Gemini in parallel
     hybrid_task = asyncio.to_thread(_hybrid_classifier.classify, image_bytes)
-    gemini_task = asyncio.to_thread(_gemini_get_details_sync, image_bytes)
+    gemini_task = asyncio.to_thread(_gemini_get_details_sync, image_bytes, user_id)
 
-    # CV color (CPU-bound; run before awaiting)
+    # CV color (CPU-bound; kept off the event loop)
     cv_color = "unknown"
     if original_img is not None:
         try:
-            fg_img   = remove(original_img, session=_rembg_session)
-            cv_color = _dominant_color_from_rgba(fg_img, original_img)
+            fg_img   = await asyncio.to_thread(remove_background_image, original_img)
+            cv_color = await asyncio.to_thread(_dominant_color_from_rgba, fg_img, original_img)
         except Exception as exc:
-            log.warning("rembg/color failed: %s", exc)
+            log.warning("rembg/color failed: %s", error_label(exc))
 
     hybrid_result  = await hybrid_task
     gemini_details = await gemini_task

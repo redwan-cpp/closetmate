@@ -21,12 +21,12 @@ Output:
 from __future__ import annotations
 
 import logging
-import sqlite3
-from typing import List
+from typing import Any, List
 
 from fastapi import APIRouter, Depends, HTTPException
 
 from database import get_db
+from security import current_user_id, require_same_user
 from models.outfit import (
     OutfitContext,
     OutfitItem,
@@ -49,7 +49,8 @@ router = APIRouter()
 )
 def outfit_recommendation(
     payload: OutfitRecommendationRequest,
-    db: sqlite3.Connection = Depends(get_db),
+    uid: str = Depends(current_user_id),
+    db: Any = Depends(get_db),
 ) -> OutfitRecommendationResponse:
     """
     Generate ranked outfit combinations from the user's wardrobe.
@@ -59,9 +60,10 @@ def outfit_recommendation(
     - Color harmony and cultural relevance scores determine the final ranking.
     - The `scores` field exposes the full breakdown for each returned outfit.
     """
+    require_same_user(payload.user_id, uid)
     try:
         result = recommend_outfits(
-            user_id=payload.user_id,
+            user_id=uid,
             occasion=payload.occasion,
             environment=payload.environment,
             temperature=payload.temperature,
@@ -70,7 +72,7 @@ def outfit_recommendation(
         )
     except Exception as exc:
         log.exception("outfit_recommendation failed: %s", exc)
-        raise HTTPException(status_code=500, detail=f"Recommendation failed: {exc}") from exc
+        raise HTTPException(status_code=500, detail="Recommendation failed. Please try again.") from exc
 
     # ── Parse Pydantic models from raw dicts ────────────────────────────────
     def _parse_items(raw_list: list) -> List[OutfitItem]:

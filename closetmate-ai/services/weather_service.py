@@ -89,7 +89,7 @@ def get_weather_by_coords(lat: float, lon: float, city_hint: str = "") -> Weathe
     }
     qs = urllib.parse.urlencode(params)
     url = f"https://api.open-meteo.com/v1/forecast?{qs}"
-    log.info("Fetching weather: %s", url)
+    log.info("Fetching weather")   # never log the URL: it carries the user's exact coordinates
 
     data = _http_get_json(url)
     curr = data.get("current", {})
@@ -124,7 +124,7 @@ def get_weather_by_city(city_name: str) -> Optional[WeatherData]:
         "limit":  1,
     })
     geo_url = f"https://nominatim.openstreetmap.org/search?{geo_params}"
-    log.info("Geocoding city: %s", city_name)
+    log.info("Geocoding a city name")
 
     try:
         geo_data = _http_get_json(geo_url)

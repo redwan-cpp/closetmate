@@ -119,15 +119,22 @@ venv\Scripts\activate        # Windows
 # source venv/bin/activate   # macOS/Linux
 
 # Install dependencies
-pip install -r requirement.txt
+pip install -r requirements.txt
 
 # Set your OpenAI API key
 set OPENAI_API_KEY=sk-...    # Windows
 # export OPENAI_API_KEY=sk-... # macOS/Linux
 
-# Run the server
-uvicorn app:app --reload --port 8000
+# Run the server (main.py is the real entry point; app.py is a legacy single-file service)
+uvicorn main:app --reload --port 8000
+
+# Run the tests
+pip install -r requirements-dev.txt
+python -m pytest -q
 ```
+
+Every endpoint except `/auth/*` and `/analyze-skin-tone` needs `Authorization: Bearer <token>` from
+`POST /auth/login`. See `closetmate-ai/DEPLOY.md` for production settings.
 
 The API will be available at `http://127.0.0.1:8000`.
 

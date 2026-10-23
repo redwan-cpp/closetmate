@@ -525,5 +525,5 @@ Respond ONLY in this JSON format:
             "all_outfits": outfits,
             "stylist_note": f"Top pick based on your wardrobe for {occasion}.",
             "weather_category": weather_cat,
-            "ai_error": str(e),
+            "ai_error": type(e).__name__,   # class only: never echo provider error text to clients
         }

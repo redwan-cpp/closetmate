@@ -1,25 +1,36 @@
 # routers/chat.py
 # ─────────────────────────────────────────────────────────────────
-# POST /chat/message
-# POST /chat/weather   ← NEW: fetch weather context for location
-# Primary:  OpenAI GPT-4o-mini (12 s timeout)
-# Fallback: Gemini 2.0 Flash REST (no extra SDK)
+# POST /chat/message         AI stylist             (monthly quota: "chat")
+# POST /chat/weather         weather for a location (rate-limited)
+# GET  /chat/insights/{id}   personalised insights  (monthly quota: "insights")
+#
+# Every route needs a valid access token (applied in main.py) and only ever
+# reads the *authenticated* user's wardrobe. The wardrobe/profile are loaded in
+# a short DB session that is CLOSED before the slow LLM call, so a pooled
+# connection is never held while waiting on a provider.
+# Suggested items carry their outfit `slot` (top/bottom/dress/…) so the app can compose
+# them into a lookboard, and the reply carries `look_meta` (colour match, weather) for chips.
+# Primary: OpenAI. Fallback: Gemini. Both go through services/llm_gateway.py,
+# which owns model IDs, timeouts and per-call usage metering.
 # ─────────────────────────────────────────────────────────────────
 
-import os
-import json
 import asyncio
+import json
 import logging
-import pathlib
+from typing import List, Optional
 
-from fastapi import APIRouter, HTTPException
-from pydantic import BaseModel
-from typing import Optional, List
-from openai import AsyncOpenAI
+from fastapi import APIRouter, Depends, HTTPException
+from pydantic import BaseModel, Field
 from sqlalchemy import text
 
-from database import get_db
-from fastapi import Depends
+from database import db_session
+from models.profile import split_skin_tone
+from quota import metered
+from ratelimit import rate_limit_user
+from security import current_user_id, require_same_user
+from services.llm_gateway import gemini_generate, openai_chat
+from settings import get_settings
+from services.outfit_layout import look_meta, outfit_slot
 from services.weather_service import (
     get_weather_by_city,
     get_weather_by_coords,
@@ -53,6 +64,27 @@ PROFILE RULES:
   * inverted_triangle → balance shoulders with wide-leg pants, A-line, avoid shoulder pads
 - Always mention briefly why a recommendation suits THEIR specific tone and shape.
 - If skin_tone or body_shape is unknown, ask the user to complete their profile scan.
+
+═══════════════════════════════════════════
+ACCESSORIES — ALWAYS CHECK THE WARDROBE FOR THESE
+═══════════════════════════════════════════
+
+When building any outfit recommendation, ALWAYS check the wardrobe for accessories and include them if present:
+- ⌚ WATCH: suggest a watch from the wardrobe if one exists. Pair dress/metal-strap watches with formal outfits; sport/rubber-strap watches with casual.
+- 👜 BAG: suggest a bag if the occasion calls for it (work → tote/structured bag, casual → backpack/crossbody, evening → clutch).
+- 🕶️ SUNGLASSES: suggest sunglasses for outdoor daytime looks if available.
+- 👒 CAP/HAT: suggest caps for casual/sporty looks; structured hats for formal.
+- 💍 JEWELRY: suggest necklaces, bracelets, earrings for formal, festive, or date outfits if in wardrobe.
+- 👔 TIE/POCKET SQUARE: always include with formal suit outfits if available.
+- 👝 BELT: suggest belts with trousers/jeans when a belt is in the wardrobe.
+- 🧣 SCARF: suggest scarves in cold weather or as a style accent.
+
+ACCESSORY RULES:
+- ALWAYS include accessories in the <outfit> block with their exact item_id.
+- A watch does NOT replace clothing. It goes ON TOP of a complete outfit.
+- Never suggest jewelry with sportswear unless explicitly asked.
+- For formal/festive outfits, always check for and mention jewelry/ties if they exist.
+- Match metals: silver/white-gold jewelry → cool tones; gold/rose-gold → warm tones.
 
 ═══════════════════════════════════════════
 ABSOLUTE OUTFIT COMBINATION RULES — NEVER BREAK THESE
@@ -153,8 +185,8 @@ class WeatherContext(BaseModel):
 
 class ChatRequest(BaseModel):
     user_id: str
-    message: str
-    history: Optional[List[HistoryEntry]] = []
+    message: str = Field(min_length=1, max_length=1000)
+    history: Optional[List[HistoryEntry]] = Field(default=[], max_length=20)
     weather: Optional[WeatherContext] = None
 
 
@@ -163,12 +195,22 @@ class SuggestedItem(BaseModel):
     color: str
     item_id: Optional[str] = None
     image_url: Optional[str] = None
+    category: Optional[str] = None
+    slot: Optional[str] = None      # outer | dress | top | bottom | shoes | accessory
 
 
 class ChatResponse(BaseModel):
     reply: str
     suggested_items: Optional[List[SuggestedItem]] = None
     weather_summary: Optional[dict] = None    # ← echo back weather so frontend can display it
+    look_meta: Optional[dict] = None          # facts for the outfit card chips (colour match, weather)
+
+class StyleInsightsResponse(BaseModel):
+    best_colors: List[str]
+    avoid_colors: List[str]
+    silhouettes: List[str]
+    wardrobe_gaps: List[str]
+    general_tip: str
 
 
 # ─────────────────────────────────────────────
@@ -249,6 +291,12 @@ def _wardrobe_context(rows) -> str:
 # Parse outfit block
 # ─────────────────────────────────────────────
 
+def _known_colour(value: Optional[str]) -> Optional[str]:
+    """A usable colour name, or None for blank / "unknown" (the default for items saved without one)."""
+    text = (value or "").strip()
+    return text if text and text.lower() != "unknown" else None
+
+
 def _extract_outfit(raw: str):
     if "<outfit>" not in raw or "</outfit>" not in raw:
         return raw.strip(), None
@@ -272,21 +320,65 @@ def _extract_outfit(raw: str):
 
 
 # ─────────────────────────────────────────────
-# Env key loader
+# DB context — short session, closed before any LLM call
 # ─────────────────────────────────────────────
 
-def _load_key(name: str) -> Optional[str]:
-    val = os.getenv(name)
-    if val:
-        return val
-    env_path = pathlib.Path(__file__).parent.parent / ".env"
-    if env_path.exists():
-        for line in env_path.read_text(encoding="utf-8").splitlines():
-            line = line.strip()
-            if line.startswith(f"{name}="):
-                return line.split("=", 1)[1].strip().strip('"').strip("'")
-    return None
+_PROVIDER_TIMEOUT = 12.0     # seconds allowed per provider attempt
 
+
+def _load_wardrobe_and_profile(uid: str, *, with_images: bool):
+    """Return (wardrobe_rows, profile_dict_or_None) using one short DB session."""
+    columns = ("item_id, category, subcategory, primary_color, material, "
+               "pattern, formality_level, cultural_style")
+    if with_images:
+        columns += ", image_path"
+    # Newest N items only: every wardrobe row becomes prompt tokens, so an unbounded
+    # closet would make the cost of ONE quota unit unbounded.
+    limit = get_settings().chat_wardrobe_limit
+    with db_session() as db:   # `columns` is a code constant, never user input
+        raw_rows = db.execute(
+            text(f"SELECT {columns} FROM wardrobe_items WHERE user_id = :uid "
+                 "ORDER BY created_at DESC LIMIT :lim"),
+            {"uid": uid, "lim": limit},
+        ).fetchall()
+        profile_row = db.execute(
+            text("SELECT skin_tone, body_shape, gender FROM users WHERE user_id = :uid"),
+            {"uid": uid},
+        ).fetchone()
+    rows = [dict(r._mapping) for r in raw_rows]
+    profile = dict(profile_row._mapping) if profile_row else None
+    return rows, profile
+
+
+def _profile_context(profile: Optional[dict], *, emoji: bool) -> str:
+    """Profile block for a prompt — the one implementation shared by chat and insights."""
+    if not profile:
+        return _NO_PROFILE_CONTEXT
+    skin_band, undertone = split_skin_tone(profile.get("skin_tone"))
+    body = profile.get("body_shape") or "unknown"
+    gender = profile.get("gender") or "unknown"
+
+    from services.skin_tone_detector import _TONE_COLORS
+    palette = (
+        _TONE_COLORS.get(skin_band, {}).get(undertone)
+        or _TONE_COLORS.get(skin_band, {}).get("neutral")
+        or []
+    )
+    color_list = ", ".join(palette[:6]) if palette else "versatile palette"
+
+    if emoji:
+        return (
+            f"👤 Gender: {gender}\n"
+            f"🎨 Skin Tone: {skin_band} with {undertone} undertone\n"
+            f"✨ Best Colors for This Tone: {color_list}\n"
+            f"📐 Body Shape: {body}"
+        )
+    return (
+        f"Gender: {gender}\n"
+        f"Skin Tone: {skin_band} (undertone: {undertone})\n"
+        f"Algorithmically Recommended Colors: {color_list}\n"
+        f"Body Shape: {body}"
+    )
 
 # ─────────────────────────────────────────────
 # Weather fetch helper
@@ -307,73 +399,15 @@ async def _resolve_weather(ctx: Optional[WeatherContext]) -> Optional[WeatherDat
         log.warning("Weather fetch error: %s", exc)
     return None
 
-
-# ─────────────────────────────────────────────
-# OpenAI call
-# ─────────────────────────────────────────────
-
-_TIMEOUT = 12.0
-
-
-async def _call_openai(messages: list, api_key: str) -> str:
-    client = AsyncOpenAI(api_key=api_key, timeout=_TIMEOUT)
-    resp = await client.chat.completions.create(
-        model="gpt-4o-mini",
-        messages=messages,
-        max_tokens=350,
-        temperature=0.5,
-    )
-    return resp.choices[0].message.content.strip()
-
-
-# ─────────────────────────────────────────────
-# Gemini fallback (REST — no extra SDK)
-# ─────────────────────────────────────────────
-
-async def _call_gemini(messages: list) -> Optional[str]:
-    """Call Gemini 2.0 Flash as a fallback when OpenAI fails/times out."""
-    import requests as _req
-
-    api_key = _load_key("GEMINI_API_KEY")
-    if not api_key:
-        log.warning("GEMINI_API_KEY not set — no fallback available")
-        return None
-
-    contents = []
-    for msg in messages:
-        if msg["role"] == "system":
-            contents.append({"role": "user",  "parts": [{"text": msg["content"]}]})
-            contents.append({"role": "model", "parts": [{"text": "Understood. I'll follow these instructions."}]})
-        elif msg["role"] == "user":
-            contents.append({"role": "user",  "parts": [{"text": msg["content"]}]})
-        elif msg["role"] == "assistant":
-            contents.append({"role": "model", "parts": [{"text": msg["content"]}]})
-
-    payload = {
-        "contents": contents,
-        "generationConfig": {"temperature": 0.5, "maxOutputTokens": 350},
-    }
-    url = "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent"
-    try:
-        resp = await asyncio.to_thread(
-            _req.post, url, params={"key": api_key}, json=payload, timeout=12
-        )
-        if resp.status_code == 200:
-            text = resp.json()["candidates"][0]["content"]["parts"][0]["text"].strip()
-            log.info("Gemini fallback OK, len=%d", len(text))
-            return text
-        log.warning("Gemini fallback HTTP %d: %s", resp.status_code, resp.text[:200])
-    except Exception as exc:
-        log.warning("Gemini fallback exception: %s", exc)
-    return None
-
-
 # ─────────────────────────────────────────────
 # Weather endpoint
 # ─────────────────────────────────────────────
 
 @router.post("/weather", response_model=WeatherResponse)
-async def get_weather(request: WeatherRequest):
+async def get_weather(
+    request: WeatherRequest,
+    _rate: None = Depends(rate_limit_user("weather", 30, 60)),
+):
     """
     Fetch real-time weather for a location and return it formatted for ClosetMate.
     The frontend calls this when the user shares their location, then passes
@@ -417,25 +451,24 @@ async def get_weather(request: WeatherRequest):
         style_advisory=advisory_line,
     )
 
-
 # ─────────────────────────────────────────────
 # Chat endpoint
 # ─────────────────────────────────────────────
 
 @router.post("/message", response_model=ChatResponse)
-async def chat_message(request: ChatRequest, db=Depends(get_db)):
-    return await _handle_chat(request, db)
+async def chat_message(
+    request: ChatRequest,
+    uid: str = Depends(current_user_id),
+    _rate: None = Depends(rate_limit_user("chat", 20, 60)),
+):
+    require_same_user(request.user_id, uid)
+    # Consumes a monthly unit; refunds it only if WE fail before a provider answers.
+    async with metered(uid, "chat"):
+        return await _handle_chat(request, uid)
 
 
-async def _handle_chat(request: ChatRequest, db) -> ChatResponse:
-    # Fetch wardrobe
-    raw_rows = db.execute(
-        text("""SELECT item_id, category, subcategory, primary_color, material,
-                  pattern, formality_level, cultural_style, image_path
-           FROM wardrobe_items WHERE user_id = :uid"""),
-        {"uid": str(request.user_id)},
-    ).fetchall()
-    rows = [dict(r._mapping) for r in raw_rows]
+async def _handle_chat(request: ChatRequest, uid: str) -> ChatResponse:
+    rows, profile = await asyncio.to_thread(_load_wardrobe_and_profile, uid, with_images=True)
 
     image_index = {
         r["item_id"]: r["image_path"]
@@ -443,42 +476,7 @@ async def _handle_chat(request: ChatRequest, db) -> ChatResponse:
         if r["item_id"] and r["image_path"]
     }
 
-    # ── User profile (skin tone + body shape) ────────────────────────────────
-    user_profile_str = _NO_PROFILE_CONTEXT
-    try:
-        profile_row = db.execute(
-            text("SELECT skin_tone, body_shape, gender FROM users WHERE user_id = :uid"),
-            {"uid": str(request.user_id)},
-        ).fetchone()
-        if profile_row:
-            profile = dict(profile_row._mapping)
-            skin   = profile.get("skin_tone") or "unknown"
-            body   = profile.get("body_shape") or "unknown"
-            gender = profile.get("gender") or "unknown"
-
-            # Parse out undertone if stored as "light (warm)" format
-            undertone = "unknown"
-            skin_band = skin
-            if "(" in skin and ")" in skin:
-                skin_band = skin.split("(")[0].strip()
-                undertone = skin.split("(")[1].replace(")", "").strip()
-
-            from services.skin_tone_detector import _TONE_COLORS
-            rec_colors = (
-                _TONE_COLORS.get(skin_band, {}).get(undertone)
-                or _TONE_COLORS.get(skin_band, {}).get("neutral")
-                or []
-            )
-            color_list = ", ".join(rec_colors[:6]) if rec_colors else "versatile palette"
-
-            user_profile_str = (
-                f"👤 Gender: {gender}\n"
-                f"🎨 Skin Tone: {skin_band} with {undertone} undertone\n"
-                f"✨ Best Colors for This Tone: {color_list}\n"
-                f"📐 Body Shape: {body}"
-            )
-    except Exception as exc:
-        log.warning("Could not fetch user profile: %s", exc)
+    user_profile_str = _profile_context(profile, emoji=True)
 
     # ── Weather context ───────────────────────────────────────────────────────
     weather_data: Optional[WeatherData] = None
@@ -510,35 +508,39 @@ async def _handle_chat(request: ChatRequest, db) -> ChatResponse:
 
     messages: list = [{"role": "system", "content": system}]
     for turn in (request.history or [])[-6:]:
-        messages.append({"role": turn.role, "content": turn.content})
+        # Only user/assistant turns: a client must not be able to inject "system" messages.
+        if turn.role in ("user", "assistant"):
+            messages.append({"role": turn.role, "content": turn.content[:2000]})
     messages.append({"role": "user", "content": request.message})
 
     raw: Optional[str] = None
 
     # ── Primary: OpenAI ───────────────────────────────────────────────────────
-    openai_key = _load_key("OPENAI_API_KEY")
-    if openai_key:
-        try:
-            raw = await asyncio.wait_for(_call_openai(messages, openai_key), timeout=_TIMEOUT)
-            log.info("OpenAI chat OK len=%d", len(raw))
-        except asyncio.TimeoutError:
-            log.warning("OpenAI timed out after %.0fs — falling back to Gemini", _TIMEOUT)
-        except Exception as exc:
-            log.warning("OpenAI failed: %s — falling back to Gemini", exc)
-    else:
-        log.warning("OPENAI_API_KEY not configured — trying Gemini directly")
+    try:
+        raw = await openai_chat(
+            messages, feature="chat", user_id=uid,
+            max_tokens=350, temperature=0.5, timeout=_PROVIDER_TIMEOUT,
+        )
+    except Exception as exc:  # noqa: BLE001 — any provider failure falls through to Gemini
+        log.warning("OpenAI chat failed (%s) — falling back to Gemini", type(exc).__name__)
 
     # ── Fallback: Gemini ──────────────────────────────────────────────────────
-    if raw is None:
-        raw = await _call_gemini(messages)
+    if not raw:
+        raw = await gemini_generate(
+            messages, feature="chat", user_id=uid,
+            max_tokens=350, temperature=0.5, timeout=_PROVIDER_TIMEOUT,
+        )
 
-    if raw is None:
+    if not raw:
         raise HTTPException(
             status_code=503,
-            detail="AI stylist unavailable. Check OPENAI_API_KEY / GEMINI_API_KEY and restart.",
+            detail="The AI stylist is temporarily unavailable. Please try again in a moment.",
         )
 
     reply, suggested_items = _extract_outfit(raw)
+
+    # Colours the "in your best colors" chip is judged on, one per suggested item.
+    palette_colors: list[Optional[str]] = []
 
     # ── Attach image paths to suggested items ─────────────────────────────────
     if suggested_items:
@@ -566,6 +568,7 @@ async def _handle_chat(request: ChatRequest, db) -> ChatResponse:
             return p.lstrip("/")
 
         enriched = []
+        rows_by_id = {r["item_id"]: r for r in rows if r.get("item_id")}
         for item in suggested_items:
             image_url: Optional[str] = None
             resolved_item_id: Optional[str] = item.item_id
@@ -591,17 +594,112 @@ async def _handle_chat(request: ChatRequest, db) -> ChatResponse:
                     if not resolved_item_id:
                         resolved_item_id = match.get("item_id")
 
+            row = rows_by_id.get(resolved_item_id) if resolved_item_id else None
+            category = row.get("category") if row else None
+            # Judge the real garment, not the model's wording: the row's colour wins. Only an
+            # item with no wardrobe row falls back to what the model said, and "unknown" is
+            # never counted as a colour.
+            if row is not None:
+                palette_colors.append(_known_colour(row.get("primary_color")))
+            else:
+                palette_colors.append(_known_colour(item.color))
             enriched.append(SuggestedItem(
                 subcategory=item.subcategory,
                 color=item.color,
                 item_id=resolved_item_id,
                 image_url=image_url,
+                category=category,
+                slot=outfit_slot(category, (row.get("subcategory") if row else None) or item.subcategory),
             ))
         suggested_items = enriched
 
     log.info("Reply len=%d outfit_items=%d", len(reply), len(suggested_items or []))
+    meta = None
+    if suggested_items:
+        meta = look_meta(
+            [{"color": c} for c in palette_colors],
+            (profile or {}).get("skin_tone"),
+            weather_summary,
+        )
     return ChatResponse(
         reply=reply,
         suggested_items=suggested_items,
         weather_summary=weather_summary,
+        look_meta=meta,
     )
+
+# ─────────────────────────────────────────────
+# Style Insights Endpoint
+# ─────────────────────────────────────────────
+
+_INSIGHTS_PROMPT = """You are an expert AI fashion stylist.
+Analyze the user's profile and their actual wardrobe items.
+Generate a highly personalized style insight profile.
+
+You MUST return ONLY valid JSON matching exactly this structure:
+{
+  "best_colors": ["color1", "color2", "color3"],
+  "avoid_colors": ["color1", "color2"],
+  "silhouettes": ["shape1", "shape2", "shape3"],
+  "wardrobe_gaps": ["item1", "item2"],
+  "general_tip": "One concise, empowering sentence about their style."
+}
+
+User Profile:
+{user_profile}
+
+Current Wardrobe:
+{wardrobe}
+"""
+
+@router.get("/insights/{user_id}", response_model=StyleInsightsResponse)
+async def get_style_insights(
+    user_id: str,
+    uid: str = Depends(current_user_id),
+    _rate: None = Depends(rate_limit_user("insights", 6, 60)),
+):
+    require_same_user(user_id, uid)
+    async with metered(uid, "insights"):
+        return await _generate_insights(uid)
+
+
+async def _generate_insights(uid: str) -> StyleInsightsResponse:
+    rows, profile = await asyncio.to_thread(_load_wardrobe_and_profile, uid, with_images=False)
+
+    prompt = (
+        _INSIGHTS_PROMPT
+        .replace("{user_profile}", _profile_context(profile, emoji=False))
+        .replace("{wardrobe}", _wardrobe_context(rows))
+    )
+    messages = [{"role": "system", "content": prompt}]
+
+    raw: Optional[str] = None
+    try:
+        raw = await openai_chat(
+            messages, feature="insights", user_id=uid,
+            max_tokens=300, temperature=0.4, timeout=15.0, json_mode=True,
+        )
+    except Exception as exc:  # noqa: BLE001
+        log.warning("OpenAI insights failed (%s) — falling back to Gemini", type(exc).__name__)
+
+    if not raw:
+        raw = await gemini_generate(
+            messages, feature="insights", user_id=uid,
+            max_tokens=300, temperature=0.4, timeout=15.0, json_mode=True,
+        )
+
+    if not raw:
+        raise HTTPException(status_code=503, detail="Could not generate insights at this time.")
+
+    try:
+        data = json.loads(raw)
+        return StyleInsightsResponse(
+            best_colors=data.get("best_colors", []),
+            avoid_colors=data.get("avoid_colors", []),
+            silhouettes=data.get("silhouettes", []),
+            wardrobe_gaps=data.get("wardrobe_gaps", []),
+            general_tip=data.get("general_tip", "Stay stylish!"),
+        )
+    except Exception:  # noqa: BLE001
+        log.error("insights JSON could not be parsed (%d chars)", len(raw))
+        raise HTTPException(status_code=502, detail="Invalid insights data returned.")

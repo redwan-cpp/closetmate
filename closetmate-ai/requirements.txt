@@ -1,30 +1,35 @@
+# Pinned to the exact set that passed the full test-suite AND scripts/pg_smoke.py inside the
+# production image (python:3.11-slim). Unpinned, every deploy silently resolved to whatever was
+# newest that day (Starlette 0.x -> 1.x, openai 1.x -> 3.x, OpenCV 4 -> 5 ...).
+# To upgrade: bump deliberately, rebuild the image, run the suite and the smoke test inside it.
+
 # ── Core API ──────────────────────────────────────────────────────────────────
-fastapi
-uvicorn
-pydantic[email]
-python-multipart
-python-dotenv
+fastapi==0.161.1
+uvicorn==0.54.0
+pydantic[email]==2.14.1
+email-validator==2.3.0
+python-multipart==0.0.32
+python-dotenv==1.2.4
 
 # ── Database ──────────────────────────────────────────────────────────────────
-sqlalchemy
-psycopg2-binary
+sqlalchemy==2.0.55
+psycopg2-binary==2.9.13
 
 # ── Image processing (CPU-only, Render-compatible) ────────────────────────────
-pillow
-opencv-python-headless
-numpy
-rembg[cpu]
-onnxruntime
+pillow==13.0.0
+opencv-python-headless==5.0.0.93
+numpy==2.4.6
+rembg[cpu]==2.0.86
+onnxruntime==1.31.0
 
-# ── AI services ───────────────────────────────────────────────────────────────
-google-generativeai
-openai
-requests
-httpx
+# ── AI services (Gemini is called over REST via requests — no SDK needed) ─────
+openai==3.37.0
+requests==2.34.2
+httpx==0.28.1
 
 # ── Auth ──────────────────────────────────────────────────────────────────────
-passlib[bcrypt]
-bcrypt
+PyJWT==2.15.1
+bcrypt==5.0.0
 
 # ── Cloud Storage (production image persistence) ──────────────────────────────
-google-cloud-storage
+google-cloud-storage==3.17.1

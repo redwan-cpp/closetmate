@@ -13,9 +13,14 @@ import json
 import logging
 import os
 import pathlib
+import time
 from typing import Optional
 
 from PIL import Image
+
+from quota import mark_billed
+from services.ai_usage import error_label, log_ai_usage
+from settings import get_secret, get_settings
 
 log = logging.getLogger(__name__)
 
@@ -25,40 +30,18 @@ log = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 
 def _load_env_key(key: str) -> Optional[str]:
-    val = os.getenv(key)
-    if val:
-        return val
-    try:
-        from dotenv import load_dotenv
-        env_path = pathlib.Path(__file__).parent.parent / ".env"
-        load_dotenv(dotenv_path=env_path, override=True)
-        val = os.getenv(key)
-        if val:
-            return val
-    except Exception:
-        pass
-    env_path = pathlib.Path(__file__).parent.parent / ".env"
-    if env_path.exists():
-        try:
-            for line in env_path.read_text(encoding="utf-8").splitlines():
-                line = line.strip()
-                if not line or line.startswith("#") or "=" not in line:
-                    continue
-                k, _, v = line.partition("=")
-                v = v.strip().strip('"').strip("'")
-                if k.strip() == key and v:
-                    os.environ[key] = v
-                    return v
-        except Exception:
-            pass
-    return None
+    # Secrets come from the process environment only (main.py loads .env once at startup).
+    # The old version re-read .env on every miss, which could resurrect a key an operator
+    # had deliberately blanked and wrote values into os.environ behind settings' back.
+    return get_secret(key)
 
 
 # ---------------------------------------------------------------------------
 # Model config
 # ---------------------------------------------------------------------------
 
-_OPENAI_MODEL = "gpt-4o-mini"   # locked — never switch to another model
+# Model ID and image detail come from settings (OPENAI_VISION_MODEL / OPENAI_VISION_DETAIL),
+# so a provider retirement or a cost experiment is a config change, not a deploy.
 
 _REQUIRED_FIELDS = {
     "category", "subcategory", "culture",
@@ -117,7 +100,62 @@ _SUBCATEGORY_SYNONYMS: dict[str, str] = {
     # East Asian
     "qipao":           "cheongsam",
     "hanfu robe":      "hanfu",
+    # ── Accessories & Watches ──────────────────────────────────────────────
+    "wristwatch":      "watch",
+    "wrist watch":     "watch",
+    "smartwatch":      "watch",
+    "smart watch":     "watch",
+    "analog watch":    "watch",
+    "digital watch":   "watch",
+    "timepiece":       "watch",
+    "handbag":         "bag",
+    "tote bag":        "bag",
+    "tote":            "bag",
+    "backpack":        "bag",
+    "purse":           "bag",
+    "clutch":          "bag",
+    "sling bag":       "bag",
+    "crossbody":       "bag",
+    "crossbody bag":   "bag",
+    "shoulder bag":    "bag",
+    "messenger bag":   "bag",
+    "waist belt":      "belt",
+    "leather belt":    "belt",
+    "sunglasses":      "sunglasses",
+    "shades":          "sunglasses",
+    "eyewear":         "sunglasses",
+    "glasses":         "sunglasses",
+    "baseball cap":    "cap",
+    "snapback":        "cap",
+    "hat":             "cap",
+    "beanie":          "cap",
+    "trucker cap":     "cap",
+    "fedora":          "cap",
+    "scarf":           "scarf",
+    "muffler":         "scarf",
+    "stole":           "scarf",
+    "necklace":        "jewelry",
+    "bracelet":        "jewelry",
+    "ring":            "jewelry",
+    "earrings":        "jewelry",
+    "earring":         "jewelry",
+    "pendant":         "jewelry",
+    "chain":           "jewelry",
+    "brooch":          "jewelry",
+    "anklet":          "jewelry",
+    "bangle":          "jewelry",
+    "tie":             "tie",
+    "bow tie":         "tie",
+    "bow-tie":         "tie",
+    "necktie":         "tie",
+    "pocket square":   "pocket square",
+    "wallet":          "wallet",
+    "gloves":          "gloves",
+    "glove":           "gloves",
+    "socks":           "socks",
+    "sock":            "socks",
 }
+
 
 _CULTURE_SYNONYMS: dict[str, str] = {
     "south asian":       "south_asian",
@@ -170,7 +208,27 @@ _CATEGORY_SYNONYMS: dict[str, str] = {
     "kimono":        "traditional",
     "hanfu":         "traditional",
     "cheongsam":     "traditional",
+    # ── Accessories normalization ──────────────────────────────────────────
+    "watch":         "accessory",
+    "wristwatch":    "accessory",
+    "jewelry":       "accessory",
+    "jewellery":     "accessory",
+    "bag":           "accessory",
+    "handbag":       "accessory",
+    "purse":         "accessory",
+    "backpack":      "accessory",
+    "belt":          "accessory",
+    "sunglasses":    "accessory",
+    "glasses":       "accessory",
+    "cap":           "accessory",
+    "hat":           "accessory",
+    "scarf":         "accessory",
+    "tie":           "accessory",
+    "wallet":        "accessory",
+    "gloves":        "accessory",
+    "socks":         "accessory",
 }
+
 
 _FORMALITY_SYNONYMS: dict[str, str] = {
     "traditional":   "festive",
@@ -231,19 +289,25 @@ You MUST:
 Return STRICT JSON ONLY. No markdown, no explanation, no extra text."""
 
 _USER_PROMPT = """\
-Analyze the clothing item in this image. Return a JSON object with EXACTLY these 7 fields:
+Analyze the clothing item or accessory in this image. Return a JSON object with EXACTLY these 7 fields:
 
 "category"     — ONE of: top, bottom, footwear, dress, outerwear, accessory, traditional
-"subcategory"  — specific garment: panjabi, saree, salwar kameez, lehenga, sherwani, t-shirt, shirt, polo, blazer, suit, jacket, coat, hoodie, sweater, cardigan, jeans, trousers, shorts, skirt, dress, abaya, thobe, kimono, hanfu, cheongsam, sneakers, sandals, boots, other
+"subcategory"  — specific item type:
+  Clothing: panjabi, saree, salwar kameez, lehenga, sherwani, t-shirt, shirt, polo, blazer, suit, jacket, coat, hoodie, sweater, cardigan, jeans, trousers, shorts, skirt, dress, abaya, thobe, kimono, hanfu, cheongsam
+  Footwear: sneakers, sandals, boots, loafers, heels, slippers
+  Accessories: watch, bag, belt, sunglasses, cap, scarf, jewelry, tie, wallet, gloves, socks, pocket square, other
 "culture"      — ONE of: south_asian, western, east_asian, middle_eastern, global
-"primary_color"— the single dominant garment color, be specific (e.g. "mustard yellow", "navy blue", "ivory white", "forest green", "cherry red", "charcoal gray")
-"material"     — most likely fabric: cotton, silk, denim, linen, polyester, wool, leather, chiffon, velvet, rayon, knit, jersey, synthetic, unknown
+"primary_color"— the single dominant color, be specific (e.g. "rose gold", "navy blue", "ivory white", "forest green", "matte black")
+"material"     — most likely material: cotton, silk, denim, linen, polyester, wool, leather, chiffon, velvet, rayon, knit, jersey, metal, stainless steel, canvas, nylon, suede, synthetic, rubber, unknown
 "pattern"      — ONE of: solid, striped, floral, checked, plaid, polka dot, printed, embroidered, graphic, abstract, color block, animal print, camouflage, tie-dye, paisley, houndstooth, geometric, lace, sequined
 "formality"    — ONE of: casual, smart casual, semi-formal, formal, festive, sportswear
 
 Rules:
 - All 7 keys must be present.
 - All values must be plain strings (no arrays, no nested objects).
+- For watches: subcategory="watch", category="accessory", material should reflect the strap (leather/metal/rubber/silicone).
+- For bags: subcategory="bag", category="accessory".
+- For jewelry: subcategory="jewelry", category="accessory", material should reflect the metal/stone type.
 - Return ONLY the JSON object."""
 
 
@@ -251,7 +315,7 @@ Rules:
 # Main entry point
 # ---------------------------------------------------------------------------
 
-def analyze_clothing_with_openai(image_base64: str) -> Optional[dict]:
+def analyze_clothing_with_openai(image_base64: str, user_id: Optional[str] = None) -> Optional[dict]:
     """
     Send a base64-encoded clothing image to GPT-4o-mini.
 
@@ -270,13 +334,17 @@ def analyze_clothing_with_openai(image_base64: str) -> Optional[dict]:
         log.error("openai package not installed — run: pip install openai")
         return None
 
-    log.info("Using OpenAI Vision (%s) — multicultural mode", _OPENAI_MODEL)
+    settings = get_settings()
+    model = settings.openai_vision_model
+    log.info("Using OpenAI Vision (%s, detail=%s)", model, settings.openai_vision_detail)
 
-    client = OpenAI(api_key=api_key)
+    # The SDK default is a 10-minute timeout; a stuck call would pin a worker thread.
+    client = OpenAI(api_key=api_key, timeout=30, max_retries=1)
 
+    started = time.perf_counter()
     try:
         response = client.chat.completions.create(
-            model=_OPENAI_MODEL,
+            model=model,
             messages=[
                 {"role": "system", "content": _SYSTEM_PROMPT},
                 {
@@ -287,7 +355,7 @@ def analyze_clothing_with_openai(image_base64: str) -> Optional[dict]:
                             "type": "image_url",
                             "image_url": {
                                 "url": f"data:image/jpeg;base64,{image_base64}",
-                                "detail": "high",  # high detail for accurate cultural recognition
+                                "detail": settings.openai_vision_detail,
                             },
                         },
                     ],
@@ -296,6 +364,15 @@ def analyze_clothing_with_openai(image_base64: str) -> Optional[dict]:
             max_tokens=400,
             temperature=0.1,   # low temp = deterministic, consistent output
         )
+
+        usage = getattr(response, "usage", None)
+        log_ai_usage(
+            user_id=user_id, feature="vision", provider="openai", model=model,
+            input_tokens=getattr(usage, "prompt_tokens", None),
+            output_tokens=getattr(usage, "completion_tokens", None),
+            latency_ms=int((time.perf_counter() - started) * 1000), ok=True,
+        )
+        mark_billed()   # provider answered: a later parse failure must not refund the unit
 
         raw = response.choices[0].message.content.strip()
         log.debug("OpenAI raw response: %.500s", raw)
@@ -326,7 +403,12 @@ def analyze_clothing_with_openai(image_base64: str) -> Optional[dict]:
         log.error("OpenAI returned invalid JSON: %s", exc)
         return None
     except Exception as exc:
-        log.error("OpenAI Vision call failed: %s: %s", type(exc).__name__, exc)
+        log.error("OpenAI Vision call failed: %s", type(exc).__name__)
+        log_ai_usage(
+            user_id=user_id, feature="vision", provider="openai", model=model,
+            latency_ms=int((time.perf_counter() - started) * 1000),
+            ok=False, error=error_label(exc),
+        )
         return None
 
 

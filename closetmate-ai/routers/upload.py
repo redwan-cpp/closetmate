@@ -1,13 +1,30 @@
-from pathlib import Path
-from typing import Optional
+"""
+routers/upload.py — clothing image ingestion and AI tagging.
 
-from fastapi import APIRouter, File, HTTPException, UploadFile
+POST /upload/upload-clothing   background-removed copy stored (GCS in prod, disk locally)
+POST /upload/analyze-clothing  vision-model metadata, DB-cached by image hash
+
+Both require an access token (main.py). Vision calls cost money, so a monthly
+"vision" quota unit is consumed only on a cache MISS and refunded if our side
+fails. Heavy image work runs in a worker thread so it cannot stall other users.
+"""
+import asyncio
+import logging
+import uuid
+from pathlib import Path
+
+from fastapi import APIRouter, Depends, File, HTTPException, UploadFile
 from pydantic import BaseModel
 
 from database import get_cached_metadata, save_metadata_cache
-from services.image_processing import remove_background_and_save
+from quota import metered
+from ratelimit import rate_limit_user
+from security import current_user_id
+from services.image_processing import normalize_to_jpeg, remove_background_and_save
 from services.metadata_extractor import extract_clothing_metadata, get_image_hash
+from services.uploads import read_upload, require_image_content_type
 
+log = logging.getLogger(__name__)
 router = APIRouter()
 
 
@@ -37,50 +54,73 @@ class AnalyzeClothingResponse(BaseModel):
 
 
 # ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+def _save_original(body: bytes) -> str:
+    """
+    Fallback when background removal fails: keep a clean JPEG copy of the photo.
+
+    The bytes are always decoded and re-encoded (see normalize_to_jpeg) and stored with a
+    fixed image/jpeg type — never the client's raw bytes or Content-Type, which would let
+    anyone host arbitrary files on our bucket and would publish EXIF GPS coordinates.
+    """
+    jpeg = normalize_to_jpeg(body)
+    filename = f"{uuid.uuid4().hex}.jpg"
+
+    from services.gcs_storage import upload_bytes
+    url = upload_bytes(jpeg, filename, content_type="image/jpeg")
+    if url:
+        return url
+
+    folder = Path(__file__).resolve().parent.parent / "uploads" / "processed"
+    folder.mkdir(parents=True, exist_ok=True)
+    (folder / filename).write_bytes(jpeg)
+    return f"uploads/processed/{filename}"
+
+
+def _suggested(meta: dict) -> SuggestedMetadata:
+    return SuggestedMetadata(
+        category=meta.get("category") or "unknown",
+        subcategory=meta.get("subcategory") or "unknown",
+        primary_color=meta.get("primary_color") or "unknown",
+        material=meta.get("material") or "unknown",
+        pattern=meta.get("pattern") or "solid",
+        formality=meta.get("formality") or meta.get("formality_level") or "casual",
+        culture=meta.get("culture") or "global",
+    )
+
+
+# ---------------------------------------------------------------------------
 # Endpoints
 # ---------------------------------------------------------------------------
 
 @router.post("/upload-clothing", response_model=UploadClothingResponse)
-async def upload_clothing(file: UploadFile = File(...)) -> UploadClothingResponse:
+async def upload_clothing(
+    file: UploadFile = File(...),
+    uid: str = Depends(current_user_id),
+    _rate: None = Depends(rate_limit_user("upload", 20, 60)),
+) -> UploadClothingResponse:
     """
-    Upload a clothing image, attempt background removal, and save the result
-    under uploads/processed/. If background removal fails the original image
-    is saved instead so the caller always gets a valid server-side path.
-    Returns the relative path to the saved image.
+    Upload a clothing image, attempt background removal, and store the result.
+    If background removal fails the original image is stored instead so the
+    caller always gets a valid server-side path.
     """
-    if not file.content_type or not file.content_type.startswith("image/"):
-        raise HTTPException(status_code=400, detail="File must be an image")
+    require_image_content_type(file)
+    body = await read_upload(file)
 
     try:
-        body = await file.read()
-    except Exception as e:
-        raise HTTPException(status_code=400, detail=f"Failed to read file: {e}") from e
-
-    if not body:
-        raise HTTPException(status_code=400, detail="Empty file")
-
-    suffix = Path(file.filename or "image").suffix or ".jpg"
-    # ── Try background removal first ─────────────────────────────────────
-    try:
-        image_path = remove_background_and_save(body)
+        image_path = await asyncio.to_thread(remove_background_and_save, body)
         status = "background_removed"
-    except Exception as bg_err:
-        # Background removal failed — save the original image as a fallback
-        import uuid as _uuid
-        from pathlib import Path as _Path
-        fallback_dir = _Path(__file__).resolve().parent.parent / "uploads" / "processed"
-        fallback_dir.mkdir(parents=True, exist_ok=True)
-        fallback_name = f"{_uuid.uuid4().hex}{suffix}"
-        fallback_path = fallback_dir / fallback_name
-        fallback_path.write_bytes(body)
-        image_path = f"uploads/processed/{fallback_name}"
+    except Exception as bg_err:  # noqa: BLE001
+        log.warning("background removal failed (%s); keeping a clean copy", type(bg_err).__name__)
+        try:
+            image_path = await asyncio.to_thread(_save_original, body)
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail="Cannot decode image") from exc
         status = "original_saved"
-        print(f"[upload-clothing] Background removal failed ({bg_err}); saved original as {image_path}")
 
-    return UploadClothingResponse(
-        image_path=image_path,
-        status=status,
-    )
+    return UploadClothingResponse(image_path=image_path, status=status)
 
 
 @router.post(
@@ -88,80 +128,39 @@ async def upload_clothing(file: UploadFile = File(...)) -> UploadClothingRespons
     response_model=AnalyzeClothingResponse,
     summary="Analyze a clothing image and return structured metadata",
 )
-async def analyze_clothing(file: UploadFile = File(...)) -> AnalyzeClothingResponse:
+async def analyze_clothing(
+    file: UploadFile = File(...),
+    uid: str = Depends(current_user_id),
+    _rate: None = Depends(rate_limit_user("analyze", 20, 60)),
+) -> AnalyzeClothingResponse:
     """
-    Full metadata extraction pipeline with MD5 caching.
-
-    PRIMARY  → DB cache lookup (instant)
-    SECONDARY → OpenAI Vision GPT-4o-mini (first call only)
-    FALLBACK → Local CV pipeline (if OpenAI unavailable)
-
-    Returns: image_path, cached flag, and 7-field suggested metadata.
+    PRIMARY   → DB cache lookup (free, instant)
+    SECONDARY → OpenAI vision (costs money: consumes one "vision" quota unit)
+    FALLBACK  → local CV pipeline if the provider is unavailable
     """
-    if not file.content_type or not file.content_type.startswith("image/"):
-        raise HTTPException(status_code=400, detail="File must be an image")
+    require_image_content_type(file)
+    image_bytes = await read_upload(file)
 
-    try:
-        image_bytes = await file.read()
-    except Exception as e:
-        raise HTTPException(status_code=400, detail=f"Failed to read file: {e}") from e
-
-    if not image_bytes:
-        raise HTTPException(status_code=400, detail="Uploaded file is empty")
-
-    print("Image received")
-
-    # ── 1. Compute MD5 hash ──────────────────────────────────────────────
     image_hash = get_image_hash(image_bytes)
     image_path = f"uploads/analyzed/{image_hash}.jpg"
 
-    # ── 2. Cache lookup ──────────────────────────────────────────────────
-    cached_row = get_cached_metadata(image_hash)
+    cached_row = await asyncio.to_thread(get_cached_metadata, image_hash)
     if cached_row:
-        print("Cache hit")
-        print("Returning response")
-        return AnalyzeClothingResponse(
-            image_path=image_path,
-            cached=True,
-            suggested=SuggestedMetadata(
-                category=cached_row.get("category") or "unknown",
-                subcategory=cached_row.get("subcategory") or "unknown",
-                primary_color=cached_row.get("primary_color") or "unknown",
-                material=cached_row.get("material") or "unknown",
-                pattern=cached_row.get("pattern") or "solid",
-                formality=cached_row.get("formality") or "casual",
-                culture=cached_row.get("culture") or "global",
-            ),
-        )
-
-    # ── 3. Cache miss → run pipeline ─────────────────────────────────────
-    print("Cache miss")
-    print("Calling OpenAI Vision")
+        return AnalyzeClothingResponse(image_path=image_path, cached=True, suggested=_suggested(cached_row))
 
     try:
-        metadata = await extract_clothing_metadata(image_bytes)
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Metadata extraction failed: {e}") from e
+        # One vision unit, refunded only if we fail BEFORE the provider answers.
+        async with metered(uid, "vision"):
+            metadata = await extract_clothing_metadata(image_bytes, user_id=uid)
+    except HTTPException:
+        raise
+    except Exception:  # noqa: BLE001
+        log.exception("metadata extraction failed")
+        raise HTTPException(status_code=500, detail="Could not analyze this image. Please try again.")
 
-    # ── 4. Save result to cache ──────────────────────────────────────────
     try:
-        save_metadata_cache(image_hash, metadata)
-    except Exception as e:
-        # Non-fatal — log and continue
-        print(f"Warning: failed to write cache: {e}")
+        await asyncio.to_thread(save_metadata_cache, image_hash, metadata)
+    except Exception:  # noqa: BLE001 — non-fatal: the user still gets their result
+        log.warning("failed to write metadata cache", exc_info=True)
 
-    print("Returning response")
-
-    return AnalyzeClothingResponse(
-        image_path=image_path,
-        cached=False,
-        suggested=SuggestedMetadata(
-            category=metadata.get("category") or "unknown",
-            subcategory=metadata.get("subcategory") or "unknown",
-            primary_color=metadata.get("primary_color") or "unknown",
-            material=metadata.get("material") or "unknown",
-            pattern=metadata.get("pattern") or "solid",
-            formality=metadata.get("formality") or metadata.get("formality_level") or "casual",
-            culture=metadata.get("culture") or "global",
-        ),
-    )
+    return AnalyzeClothingResponse(image_path=image_path, cached=False, suggested=_suggested(metadata))
