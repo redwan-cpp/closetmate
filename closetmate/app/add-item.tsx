@@ -16,12 +16,10 @@ import { SafeAreaView } from "react-native-safe-area-context";
 import * as ImagePicker from "expo-image-picker";
 import { useState, useEffect, useRef } from "react";
 import { useLocalSearchParams, useRouter } from "expo-router";
-import { studioShot, analyzeClothing, addWardrobeItem } from "@/src/api/ai";
+import { studioShot, analyzeClothing, addWardrobeItem, uploadPhoto, discardPhoto } from "@/src/api/ai";
 import { prepareForUpload } from "@/src/api/images";
-import { saveStudioShot, deleteFiles, thumbPathOf } from "@/src/api/studioFiles";
 import { invalidateCloset } from "@/src/state/closetCache";
 import { Brand } from "@/constants/theme";
-import * as FileSystem from "expo-file-system/legacy";
 import { Ionicons } from "@expo/vector-icons";
 import { useAuth } from "@/src/context/AuthContext";
 
@@ -48,12 +46,10 @@ export default function AddItemScreen() {
 
   // ── Image state ───────────────────────────────────────────────────────────
   const [originalUri, setOriginalUri] = useState<string | null>(null);
-  const [previewUri, setPreviewUri] = useState<string | null>(null);    // displayable URI (local or data:)
-  // persistentImagePath stores the final image that goes into the DB:
-  //   - a base64 data URI (from /remove-bg)  → works offline, no server needed
-  //   - falls back to the original local URI if remove-bg fails
-  const [persistentImagePath, setPersistentImagePath] = useState<string>("");
-  const [imagePath, setImagePath] = useState<string>("");              // from analyze (server-relative path, NOT used for image display)
+  const [previewUri, setPreviewUri] = useState<string | null>(null);    // what is shown: the camera photo, then the studio shot
+  // The permanent key of the photo kept in the user's private cloud storage — this is what the
+  // item stores. Empty until the photo has been stored (so Save stays disabled until then).
+  const [photoKey, setPhotoKey] = useState<string>("");
 
   // ── Loading states ────────────────────────────────────────────────────────
   const [removingBg, setRemovingBg] = useState(false);
@@ -63,14 +59,17 @@ export default function AddItemScreen() {
   const [studioReady, setStudioReady] = useState(false);
   // False when the server could not find the garment cleanly (the whole photo was kept).
   const [cutoutOk, setCutoutOk] = useState(true);
-  // True when no studio shot could be made and the raw photo will be saved instead.
+  // True when no studio shot could be made and the raw photo is kept instead.
   const [studioFailed, setStudioFailed] = useState(false);
+  // True when the photo could not be stored at all (offline): nothing can be saved yet.
+  const [uploadFailed, setUploadFailed] = useState(false);
 
   // Each processImage run takes a number; if the user retakes, clears or leaves while one is
-  // still talking to the server, its late results must not touch the screen or the files.
+  // still talking to the server, its late results must not touch the screen.
   const runId = useRef(0);
-  // Files written for the photo on screen that haven't been saved to the closet yet.
-  const pendingFiles = useRef<string[]>([]);
+  // A photo that is stored in the cloud but not part of an item yet. If the user retakes, clears
+  // or leaves, it is discarded again so abandoned photos don't pile up in their storage.
+  const pendingPhotoId = useRef<string | null>(null);
   const savingRef = useRef(false);
 
   // ── Form fields ───────────────────────────────────────────────────────────
@@ -85,43 +84,16 @@ export default function AddItemScreen() {
   const loading = removingBg || analyzing;
   const displayUri = previewUri ?? originalUri;
   const hasImage = !!originalUri;
-  // Can save as long as we have any persistent image path (data URI or local URI)
-  const canSave = !!persistentImagePath && !saving;
+  const canSave = !!photoKey && !saving;
 
-  // ── Persistent image storage — document directory (survives restarts) ───
-  //
-  // The app's documentDirectory is permanent storage that React Native can
-  // read as a file:// URI with no size or memory issues — unlike base64 data
-  // URIs which silently fail to render when they exceed ~1–2 MB.
-
-  /** Copy any URI (file:// or content://) to the persistent document directory. */
-  const copyToPersistent = async (srcUri: string): Promise<string> => {
-    // Compute dir at call time — never stale even after multiple renders
-    const dir = `${FileSystem.documentDirectory ?? ''}closetmate_images/`;
-    await FileSystem.makeDirectoryAsync(dir, { intermediates: true });
-    const dest = `${dir}item_${Date.now()}.jpg`;
-    try {
-      // Fast path: direct copy (works for file:// camera URIs)
-      await FileSystem.copyAsync({ from: srcUri, to: dest });
-      console.log('[add-item] copyAsync OK ->', dest);
-    } catch {
-      // Fallback: read-as-base64 then write (works for Android gallery content:// URIs)
-      console.warn('[add-item] copyAsync failed, trying base64 fallback');
-      const b64 = await FileSystem.readAsStringAsync(srcUri, { encoding: FileSystem.EncodingType.Base64 });
-      await FileSystem.writeAsStringAsync(dest, b64, { encoding: FileSystem.EncodingType.Base64 });
-      console.log('[add-item] base64 fallback OK ->', dest);
-    }
-    return dest;
-  };
-
-  // (Studio shots are written by saveStudioShot in src/api/studioFiles.ts.)
-  /** Forget the files of a photo that was never saved to the closet. */
+  /** Forget the stored photo of an item that was never saved. */
   const discardPending = () => {
-    deleteFiles(pendingFiles.current);
-    pendingFiles.current = [];
+    const id = pendingPhotoId.current;
+    pendingPhotoId.current = null;
+    if (id) discardPhoto(id);
   };
 
-  // Leaving the screen cancels whatever is still running and removes unsaved files.
+  // Leaving the screen cancels whatever is still running and discards an unused stored photo.
   useEffect(() => () => {
     runId.current += 1;
     discardPending();
@@ -132,40 +104,20 @@ export default function AddItemScreen() {
   const processImage = async (uri: string) => {
     const run = ++runId.current;
     const stale = () => run !== runId.current;
-    discardPending();                           // files of the previous, unsaved photo
+    discardPending();                           // the previous, unsaved photo
 
     setRemovingBg(true);
     setAnalyzing(true);
     setStudioReady(false);
     setStudioFailed(false);
+    setUploadFailed(false);
     setCutoutOk(true);
-    // Show original photo immediately so the screen isn't blank while we work
+    // Show the camera photo immediately so the screen isn't blank while we work
     setPreviewUri(uri);
-    setPersistentImagePath('');
+    setPhotoKey('');
 
-    // ── STEP 1: Copy original photo to document directory (instant, offline) ─
-    // Gives us a persistent file:// path we can store in DB right away.
-    // React Native renders file:// URIs efficiently at any size.
-    let persistentFallback = uri; // raw camera URI as last resort
-    try {
-      const copied = await copyToPersistent(uri);
-      if (stale()) { deleteFiles([copied]); return; }
-      persistentFallback = copied;
-      pendingFiles.current.push(copied);
-      setPreviewUri(persistentFallback);        // upgrade preview to doc-dir copy
-      setPersistentImagePath(persistentFallback); // can save now
-    } catch (e) {
-      if (stale()) return;
-      console.warn('[add-item] copyToPersistent failed, using raw URI:', e);
-      setPreviewUri(uri);
-      setPersistentImagePath(uri); // still saveable, just not ideal
-    }
-
-    // ── STEP 2: Studio shot + analyze metadata in parallel ───────────────
     // Shrink once (≈1600 px JPEG): the server rejects very large images, and this cuts the
-    // upload from several MB to a few hundred KB. The original is still what we keep on-device.
-    // studioShot has its own 60 s timeout (Cloud Run cold starts take 15–20 s); that is the only
-    // timer, so a result is never thrown away after the server has already spent the quota on it.
+    // upload from several MB to a few hundred KB.
     let uploadUri = uri;
     try {
       uploadUri = await prepareForUpload(uri);
@@ -173,44 +125,49 @@ export default function AddItemScreen() {
       console.warn('[add-item] could not shrink the photo, uploading as is:', e);
     }
     if (stale()) return;
+
+    // The studio shot (the server keeps it in the user's private storage: store: true) and the
+    // AI tagging run in parallel. studioShot has its own 60 s timeout (Cloud Run cold starts take
+    // 15–20 s); that is the only timer, so a result is never thrown away after the quota is spent.
     const [bgResult, analyzeResult] = await Promise.allSettled([
-      studioShot(uploadUri),
+      studioShot(uploadUri, { store: true }),
       analyzeClothing(uploadUri),
     ]);
-    if (stale()) return;
+    const shot = bgResult.status === 'fulfilled' ? bgResult.value : null;
+    if (stale()) {
+      if (shot?.photoId) discardPhoto(shot.photoId);      // stored, but nobody wants it any more
+      return;
+    }
 
     // ── Studio shot ───────────────────────────────────────────────────────
     setRemovingBg(false);
-    if (bgResult.status === 'fulfilled') {
+    if (shot?.photoId && shot.imagePath) {
+      pendingPhotoId.current = shot.photoId;
+      setPhotoKey(shot.imagePath);
+      setPreviewUri(shot.image);                          // the studio shot itself (a small data URI)
+      setCutoutOk(shot.cutoutOk);
+      setStudioReady(true);
+    } else {
+      console.warn('[add-item] studio shot failed (keeping the original):',
+        bgResult.status === 'rejected' ? bgResult.reason : 'no stored photo in the reply');
+      setStudioFailed(true);
+      // No studio shot: keep the original photo itself in the cloud, so it still survives a reinstall.
       try {
-        // Save the studio shot to persistent files (NOT a data URI)
-        const processedPath = await saveStudioShot(bgResult.value);
-        if (stale()) { deleteFiles([processedPath, thumbPathOf(processedPath)]); return; }
-        // The closet only ever shows the studio shot, so the full-size camera copy is dead weight.
-        if (persistentFallback !== uri) {
-          deleteFiles([persistentFallback]);
-          pendingFiles.current = pendingFiles.current.filter((p) => p !== persistentFallback);
-        }
-        pendingFiles.current.push(processedPath, thumbPathOf(processedPath));
-        setPreviewUri(processedPath);
-        setPersistentImagePath(processedPath); // upgrade to the clean studio shot
-        setCutoutOk(bgResult.value.cutoutOk);
-        setStudioReady(true);
+        const photo = await uploadPhoto(uploadUri);
+        if (stale()) { discardPhoto(photo.photoId); return; }
+        pendingPhotoId.current = photo.photoId;
+        setPhotoKey(photo.imagePath);
       } catch (e) {
         if (stale()) return;
-        console.warn('[add-item] could not save bg result, keeping original:', e);
-        setStudioFailed(true);
+        console.warn('[add-item] could not store the photo:', e);
+        setUploadFailed(true);
       }
-    } else {
-      console.warn('[add-item] studio shot failed (using original):', bgResult.reason);
-      setStudioFailed(true);
     }
 
     // ── Analyze autofill ──────────────────────────────────────────────────
     setAnalyzing(false);
     if (analyzeResult.status === 'fulfilled') {
-      const { suggested, image_path } = analyzeResult.value;
-      setImagePath(image_path ?? '');
+      const { suggested } = analyzeResult.value;
       if (suggested.category)      setCategory(suggested.category);
       if (suggested.subcategory)   setSubcategory(suggested.subcategory);
       if (suggested.primary_color) setColor(suggested.primary_color);
@@ -253,7 +210,7 @@ export default function AddItemScreen() {
       const uri = result.assets[0].uri;
       setOriginalUri(uri);
       setPreviewUri(null);
-      setPersistentImagePath("");
+      setPhotoKey("");
       processImage(uri);
     }
   };
@@ -265,11 +222,11 @@ export default function AddItemScreen() {
     setAnalyzing(false);
     setStudioReady(false);
     setStudioFailed(false);
+    setUploadFailed(false);
     setCutoutOk(true);
     setOriginalUri(null);
     setPreviewUri(null);
-    setPersistentImagePath("");
-    setImagePath("");
+    setPhotoKey("");
     setCategory("");
     setSubcategory("");
     setColor("");
@@ -290,9 +247,7 @@ export default function AddItemScreen() {
     try {
       await addWardrobeItem({
         user_id: activeUserId,
-        // persistentImagePath is a file:// path in the app's document directory —
-        // permanent storage that React Native renders efficiently at any image size.
-        image_path: persistentImagePath,
+        image_path: photoKey,     // the stored photo's key: the closet loads it from the cloud
         category:      category.trim()     || "unknown",
         subcategory:   subcategory.trim()  || "unknown",
         primary_color: color.trim()        || "unknown",
@@ -301,7 +256,7 @@ export default function AddItemScreen() {
         formality:     style.trim()        || "casual",
         culture:       "global",
       });
-      pendingFiles.current = [];   // saved: these files now belong to the closet
+      pendingPhotoId.current = null;   // saved: the photo now belongs to the item
       invalidateCloset();   // the closet grid and the swap sheet must see the new piece
       Alert.alert("Added! ✓", "Item saved to your closet.", [
         { text: "OK", onPress: () => router.back() },
@@ -383,9 +338,14 @@ export default function AddItemScreen() {
             We couldn’t cut this out cleanly. A plainer background and good light work best — you can retake it.
           </Text>
         )}
-        {studioFailed && !loading && hasImage && (
+        {studioFailed && !uploadFailed && !loading && hasImage && (
           <Text style={styles.cutoutHint} accessibilityRole="alert">
             We couldn’t make a studio shot this time, so your original photo will be used. You can retake it, or add it as it is.
+          </Text>
+        )}
+        {uploadFailed && !loading && hasImage && (
+          <Text style={styles.cutoutHint} accessibilityRole="alert">
+            We couldn’t save this photo. Check your connection and retake it.
           </Text>
         )}
 

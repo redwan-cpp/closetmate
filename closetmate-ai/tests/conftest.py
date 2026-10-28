@@ -70,7 +70,7 @@ DEFAULT_PASSWORD = "correct-horse-battery"
 
 _TABLES = (
     "users", "wardrobe_items", "worn_logs", "refresh_tokens",
-    "usage_counters", "ai_usage", "clothing_metadata_cache", "saved_looks",
+    "usage_counters", "ai_usage", "clothing_metadata_cache", "saved_looks", "photos",
 )
 
 
@@ -182,6 +182,17 @@ def _no_network(monkeypatch):
     monkeypatch.setattr(requests.adapters.HTTPAdapter, "send", _blocked)
     monkeypatch.setattr(httpx.HTTPTransport, "handle_request", _blocked)
     monkeypatch.setattr(httpx.AsyncHTTPTransport, "handle_async_request", _blocked_async)
+
+
+@pytest.fixture(autouse=True)
+def _photo_store(tmp_path):
+    """Every test stores photos in its own throw-away folder (never the real photo_store/)."""
+    from services import photo_store
+
+    store = photo_store.DiskStore(tmp_path / "photo-root")
+    photo_store.set_store(store)
+    yield store
+    photo_store.set_store(None)
 
 
 @pytest.fixture(autouse=True)

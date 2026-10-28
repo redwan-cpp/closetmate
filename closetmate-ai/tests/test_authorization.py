@@ -45,6 +45,10 @@ PROTECTED = [
     ("GET", "/auth/profile"),
     ("PATCH", "/auth/profile"),
     ("GET", "/auth/usage"),
+    ("POST", "/auth/delete-account"),
+    ("PATCH", "/wardrobe/item/some-item/image"),
+    ("POST", "/photos"),
+    ("DELETE", "/photos/" + "a" * 32),
 ]
 
 
@@ -60,6 +64,18 @@ class TestProtectedRoutesNeedAToken:
 
     def test_legacy_dev_token_is_401(self, client, method, path):
         assert client.request(method, path, headers=bearer("dev-1234-legacy")).status_code == 401
+
+
+class TestFilesRouteIsPublicButNotOpen:
+    """GET /files takes no bearer token (image views can't refresh one) — the signature is the credential."""
+
+    def test_it_is_not_behind_the_bearer_dependency_but_refuses_unsigned_requests(self, client):
+        key = "photos/u1/" + "a" * 32 + ".webp"
+        resp = client.get(f"/files/{key}")
+        assert resp.status_code == 403 and "www-authenticate" not in resp.headers      # not a 401 challenge
+
+    def test_every_other_route_that_serves_stored_files_is_absent(self, client):
+        assert client.get("/photos/anything").status_code in (404, 405)               # no listing or reading by id
 
 
 class TestPublicRoutes:

@@ -18,16 +18,20 @@ import io
 import logging
 
 import numpy as np
-from fastapi import APIRouter, Depends, File, HTTPException, UploadFile
+from fastapi import APIRouter, Depends, File, HTTPException, Query, UploadFile
 from fastapi.responses import Response
 from PIL import Image, ImageFilter, ImageStat, UnidentifiedImageError
 
 from quota import metered, release_quota
 from ratelimit import rate_limit_user
+from database import db_session
+from routers.photos import PHOTOS_FULL, save_photo_for
 from security import current_user_id
 from services.image_processing import process_image_bytes, remove_background_image
+from services.photo_store import photo_count
 from services.studio import StudioShotError, make_studio_shot
-from services.uploads import read_upload, require_image_content_type
+from services.uploads import heavy_image_work, read_upload, require_image_content_type
+from settings import get_settings
 
 log = logging.getLogger(__name__)
 router = APIRouter()
@@ -145,13 +149,19 @@ class _UnusablePhoto(HTTPException):
         super().__init__(status_code=422, detail=detail)
 
 
-def _studio_shot_work(body: bytes) -> dict:
+def _studio_shot_work(body: bytes, uid: str = "", store: bool = False) -> dict:
+    if store:
+        # Check the cap BEFORE the expensive segmentation, not after: a user whose storage is full
+        # must not be able to burn CPU on results that can never be kept.
+        with db_session() as db:
+            if photo_count(db, uid) >= get_settings().max_photos_per_user:
+                raise HTTPException(status_code=403, detail=PHOTOS_FULL)
     try:
         shot = make_studio_shot(body)
     except StudioShotError as exc:
         # The photo is the problem, not us: a clear 422 the app can show as-is.
         raise _UnusablePhoto(str(exc)) from exc
-    return {
+    result = {
         "image": base64.standard_b64encode(shot.full).decode("ascii"),
         "thumb": base64.standard_b64encode(shot.thumb).decode("ascii"),
         "mime": "image/webp",
@@ -159,6 +169,15 @@ def _studio_shot_work(body: bytes) -> dict:
         "height": shot.height,
         "cutout_ok": shot.cutout_ok,
     }
+    if store:
+        # Keep it in the user's private storage right away: one round trip, and the app never
+        # has to hold the only copy of a photo on the phone.
+        saved = save_photo_for(uid, shot.full, shot.thumb, "webp")
+        result.update(
+            image_path=saved["image_path"], photo_id=saved["photo_id"],
+            image_url=saved["image_url"], thumb_url=saved["thumb_url"],
+        )
+    return result
 
 
 @router.post(
@@ -167,18 +186,25 @@ def _studio_shot_work(body: bytes) -> dict:
 )
 async def studio_shot_endpoint(
     file: UploadFile = File(...),
+    store: bool = Query(False, description="Also keep the result in the caller's private photo storage"),
     uid: str = Depends(current_user_id),
     _rate: None = Depends(rate_limit_user("bgremove", 20, 60)),
 ) -> dict:
     require_image_content_type(file)
     body = await read_upload(file)
     try:
-        return await _metered(uid, lambda: _studio_shot_work(body))
+        async with heavy_image_work:        # waits (without having been charged) while two others are running
+            return await _metered(uid, lambda: _studio_shot_work(body, uid, store))
     except _UnusablePhoto:
         # Segmentation is local CPU work (no provider was billed), and a photo with no findable
         # garment is an ordinary thing for a person to try: don't charge them for it. Abuse is
         # bounded by the per-user rate limit above.
         await release_quota(uid, "bgremove")
+        raise
+    except HTTPException as exc:
+        # Storage full: the user did nothing wrong that a charge should punish.
+        if exc.status_code == 403 and isinstance(exc.detail, dict) and exc.detail.get("code") == "photos_full":
+            await release_quota(uid, "bgremove")
         raise
 
 

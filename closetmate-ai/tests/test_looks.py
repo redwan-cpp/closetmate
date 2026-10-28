@@ -13,7 +13,7 @@ from conftest import bearer
 from settings import get_settings
 
 LOOK_KEYS = {"look_id", "name", "created_at", "items"}
-LOOK_ITEM_KEYS = {"item_id", "image_path", "category", "subcategory", "primary_color", "slot"}
+LOOK_ITEM_KEYS = {"item_id", "image_path", "thumb_url", "category", "subcategory", "primary_color", "slot"}
 
 
 # ---------------------------------------------------------------------------
@@ -366,9 +366,9 @@ class TestListLooks:
         assert look["look_id"] == look_id and look["name"] == "Wedding"
         assert datetime.fromisoformat(look["created_at"]).utcoffset() == timedelta(0)
         assert look["items"] == [
-            {"item_id": saree, "image_path": "uploads/r.webp", "category": "traditional",
+            {"item_id": saree, "image_path": "uploads/r.webp", "thumb_url": None, "category": "traditional",
              "subcategory": "saree", "primary_color": "red", "slot": "dress"},
-            {"item_id": shirt, "image_path": "uploads/s.webp", "category": "top",
+            {"item_id": shirt, "image_path": "uploads/s.webp", "thumb_url": None, "category": "top",
              "subcategory": "shirt", "primary_color": "white", "slot": "top"},
         ]
         assert all(set(i) == LOOK_ITEM_KEYS for i in look["items"])

@@ -1,10 +1,8 @@
 """
-Image processing service: background removal and saving processed clothing images.
+Image processing service: background removal and image normalisation.
 Runs in CPU-only mode — compatible with Cloud Run and other serverless hosts.
 
-Storage strategy (checked at runtime):
-  1. If GCS_BUCKET env var is set  → upload to Google Cloud Storage → return public URL
-  2. Otherwise (local dev)         → save to uploads/processed/ → return relative path
+Nothing here stores anything: photos are kept by services/photo_store.py (private storage).
 """
 import io
 import logging
@@ -106,17 +104,6 @@ def remove_background_image(image: Image.Image) -> Image.Image:
     _load_rembg()
     return _rembg_remove(image, session=_rembg_session)  # type: ignore[misc]
 
-# Directory for local fallback: project_root/uploads/processed/
-_PROJECT_ROOT = Path(__file__).resolve().parent.parent
-UPLOADS_PROCESSED_DIR = _PROJECT_ROOT / "uploads" / "processed"
-
-
-def _ensure_processed_dir() -> Path:
-    """Create uploads/processed/ if it does not exist. Return the directory path."""
-    UPLOADS_PROCESSED_DIR.mkdir(parents=True, exist_ok=True)
-    return UPLOADS_PROCESSED_DIR
-
-
 def _process_image_bytes(image_bytes: bytes) -> bytes:
     """
     Run rembg background removal on raw image bytes and composite result onto
@@ -163,48 +150,6 @@ def _process_image_bytes(image_bytes: bytes) -> bytes:
     return buf.getvalue()
 
 
-def remove_background_and_save(image_bytes: bytes) -> str:
-    """
-    Run background removal on the given image bytes.
-
-    Storage:
-      - If GCS is configured (GCS_BUCKET env var set) → uploads to GCS,
-        returns the public ``https://storage.googleapis.com/…`` URL.
-      - Otherwise → saves to uploads/processed/<uuid>.png,
-        returns the relative path ``uploads/processed/<uuid>.png``.
-
-    Args:
-        image_bytes: Raw bytes of the uploaded image (JPEG/PNG/etc.).
-
-    Returns:
-        Either a full GCS URL or a relative path string.
-
-    Raises:
-        ValueError: If the image cannot be opened or processed.
-    """
-    filename = f"{uuid.uuid4().hex}.jpg"
-
-    try:
-        processed_bytes = _process_image_bytes(image_bytes)
-    except ValueError:
-        raise
-    except Exception as e:
-        raise ValueError(f"Image processing error: {e}") from e
-
-    # ── 1. Try GCS first (production) ───────────────────────────────────────
-    from services.gcs_storage import upload_bytes as _gcs_upload
-    gcs_url = _gcs_upload(processed_bytes, filename, content_type="image/jpeg")
-    if gcs_url:
-        return gcs_url  # full https:// URL
-
-    # ── 2. Fall back to local disk (development) ─────────────────────────────
-    _ensure_processed_dir()
-    output_path = UPLOADS_PROCESSED_DIR / filename
-    output_path.write_bytes(processed_bytes)
-    log.info("[image_processing] Saved locally: %s", output_path)
-    return f"uploads/processed/{filename}"
-
-
 # Public name for routers (the underscore version is kept for older imports).
 process_image_bytes = _process_image_bytes
 
@@ -227,13 +172,3 @@ def normalize_to_jpeg(image_bytes: bytes, max_side: int = 1600) -> bytes:
     buf = io.BytesIO()
     img.save(buf, format="JPEG", quality=88, optimize=True)   # no exif= argument => metadata dropped
     return buf.getvalue()
-
-
-def remove_background_and_save_from_path(input_path: str) -> str:
-    """
-    Run background removal on an image file path.
-    Delegates to remove_background_and_save() after reading the file.
-    """
-    with open(input_path, "rb") as f:
-        image_bytes = f.read()
-    return remove_background_and_save(image_bytes)

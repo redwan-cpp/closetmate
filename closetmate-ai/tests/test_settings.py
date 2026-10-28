@@ -111,7 +111,23 @@ class TestValidateForRuntime:
             fresh(clean_env, ENV="prod", JWT_SECRET=DEV_SECRET).validate_for_runtime()
 
     def test_prod_with_32_char_secret_boots(self, clean_env):
-        fresh(clean_env, ENV="prod", JWT_SECRET="x" * 32).validate_for_runtime()
+        fresh(clean_env, ENV="prod", JWT_SECRET="x" * 32, GCS_BUCKET="b").validate_for_runtime()
+
+    def test_prod_without_a_photo_bucket_refuses_to_boot(self, clean_env):
+        # Without a bucket photos would sit on the container's disk and vanish on every restart.
+        with pytest.raises(RuntimeError, match="GCS_BUCKET"):
+            fresh(clean_env, ENV="prod", JWT_SECRET="x" * 32).validate_for_runtime()
+
+    def test_dev_boots_without_a_bucket_and_uses_the_disk(self, clean_env):
+        s = fresh(clean_env, ENV="dev")
+        s.validate_for_runtime()
+        assert s.gcs_bucket == ""
+
+    def test_photo_settings_have_sane_defaults_and_can_be_overridden(self, clean_env):
+        s = fresh(clean_env, ENV="dev", MAX_WARDROBE_ITEMS="10")
+        assert s.photo_url_ttl_seconds == 6 * 3600 and s.max_photos_per_user == 110
+        s = fresh(clean_env, ENV="dev", PHOTO_URL_TTL_SECONDS="600", MAX_PHOTOS_PER_USER="7", GCS_BUCKET=" my-bucket ")
+        assert (s.photo_url_ttl_seconds, s.max_photos_per_user, s.gcs_bucket) == (600, 7, "my-bucket")
 
     def test_k_service_alone_triggers_the_prod_check(self, clean_env):
         with pytest.raises(RuntimeError):

@@ -18,6 +18,8 @@ export type Slot = 'outer' | 'dress' | 'top' | 'bottom' | 'shoes' | 'accessory';
 export interface LookPiece {
   id: string;
   uri: string | null | undefined;
+  /** Server thumbnail (stored photos). */
+  thumb?: string | null;
   slot?: string | null;
   label?: string;
 }
@@ -133,7 +135,7 @@ export const Lookboard = memo(function Lookboard({ pieces, width, onPiecePress, 
           ]}
         >
           {/* Boards wider than ~220dp would stretch the 320px thumbnail, so use the full image there. */}
-          <ItemImage uri={piece.uri} style={StyleSheet.absoluteFill} contentFit="contain" thumb={width < 220} />
+          <ItemImage uri={piece.uri} thumbSrc={piece.thumb} style={StyleSheet.absoluteFill} contentFit="contain" thumb={width < 220} />
         </Pressable>
       ))}
     </View>

@@ -7,14 +7,14 @@
 import React, { useState, useCallback } from 'react';
 import {
   StyleSheet, View, Text, ScrollView, TouchableOpacity,
-  useColorScheme, ActivityIndicator, Alert, Image, Modal
+  useColorScheme, ActivityIndicator, Alert, Image, Modal, TextInput
 } from 'react-native';
 import { SafeAreaView } from 'react-native-safe-area-context';
 import { Ionicons } from '@expo/vector-icons';
 import * as ImagePicker from 'expo-image-picker';
 import { useAuth } from '@/src/context/AuthContext';
 import { getWornHistory, WornLog, getStyleInsights, StyleInsights } from '@/src/api/ai';
-import { getProfile, updateProfile, detectSkinTone } from '@/src/api/auth';
+import { getProfile, updateProfile, detectSkinTone, deleteAccount } from '@/src/api/auth';
 import { useRouter } from 'expo-router';
 import { useFocusEffect } from '@react-navigation/native';
 
@@ -227,6 +227,38 @@ export default function ProfileScreen() {
         },
       },
     ]);
+  };
+
+  // ── Delete account (required by the app stores; irreversible, so it asks for the password) ──
+  const [showDelete, setShowDelete] = useState(false);
+  const [deletePassword, setDeletePassword] = useState('');
+  const [deleting, setDeleting] = useState(false);
+  const [deleteError, setDeleteError] = useState<string | null>(null);
+
+  const closeDelete = () => {
+    if (deleting) return;
+    setShowDelete(false);
+    setDeletePassword('');
+    setDeleteError(null);
+  };
+
+  const handleDeleteAccount = async () => {
+    if (!deletePassword || deleting) return;
+    setDeleting(true);
+    setDeleteError(null);
+    try {
+      await deleteAccount(deletePassword);
+    } catch (e) {
+      setDeleteError(e instanceof Error ? e.message : 'Could not delete your account. Please try again.');
+      setDeleting(false);
+      return;
+    }
+    // The account is gone: forget the session on this phone and leave.
+    setShowDelete(false);
+    setDeletePassword('');
+    setDeleting(false);
+    await signOut();
+    router.replace('/login');
   };
 
   const parsedSkin = parseSkinTone(profile?.skin_tone);
@@ -530,8 +562,63 @@ export default function ProfileScreen() {
           )}
         </View>
 
+        <TouchableOpacity
+          onPress={() => setShowDelete(true)}
+          accessibilityRole="button"
+          accessibilityLabel="Delete my account"
+          style={styles.deleteRow}
+        >
+          <Ionicons name="trash-outline" size={16} color="#E5484D" />
+          <Text style={styles.deleteRowText}>Delete my account</Text>
+        </TouchableOpacity>
+
         <View style={{ height: 120 }} />
       </ScrollView>
+
+      {/* ── Delete account ── */}
+      <Modal visible={showDelete} transparent animationType="fade" onRequestClose={closeDelete}>
+        <View style={styles.modalBg}>
+          <View style={[styles.modalContent, { backgroundColor: c.bg }]}>
+            <Text style={[styles.modalTitle, { color: c.text }]}>Delete your account?</Text>
+            <Text style={{ color: c.subtext, lineHeight: 20, marginBottom: 14 }}>
+              This permanently erases your closet, photos, saved looks and wear history. It can’t be undone.
+              Enter your password to confirm.
+            </Text>
+            <TextInput
+              value={deletePassword}
+              onChangeText={(text) => {
+                setDeletePassword(text);
+                if (deleteError) setDeleteError(null);
+              }}
+              placeholder="Password"
+              placeholderTextColor={c.subtext}
+              secureTextEntry
+              autoCapitalize="none"
+              autoCorrect={false}
+              editable={!deleting}
+              accessibilityLabel="Password"
+              onSubmitEditing={handleDeleteAccount}
+              style={[styles.deleteInput, { color: c.text, borderColor: c.border }]}
+            />
+            {deleteError && (
+              <Text accessibilityRole="alert" style={{ color: '#E5484D', marginTop: 8 }}>{deleteError}</Text>
+            )}
+            <TouchableOpacity
+              onPress={handleDeleteAccount}
+              disabled={!deletePassword || deleting}
+              accessibilityRole="button"
+              style={[styles.deleteConfirm, { opacity: !deletePassword || deleting ? 0.5 : 1 }]}
+            >
+              {deleting
+                ? <ActivityIndicator color="#FFFFFF" />
+                : <Text style={{ color: '#FFFFFF', fontWeight: '700' }}>Delete forever</Text>}
+            </TouchableOpacity>
+            <TouchableOpacity onPress={closeDelete} disabled={deleting} style={styles.modalCancel}>
+              <Text style={{ color: c.text, fontWeight: '600' }}>Cancel</Text>
+            </TouchableOpacity>
+          </View>
+        </View>
+      </Modal>
 
       {/* ── Shape Picker Modal ── */}
       <Modal visible={showShapePicker} transparent animationType="slide">
@@ -616,6 +703,10 @@ const dark = {
 // ── Styles ────────────────────────────────────
 
 const styles = StyleSheet.create({
+  deleteRow: { flexDirection: 'row', alignItems: 'center', justifyContent: 'center', gap: 8, marginTop: 28, paddingVertical: 14 },
+  deleteRowText: { color: '#E5484D', fontWeight: '600', fontSize: 14 },
+  deleteInput: { borderWidth: 1, borderRadius: 14, paddingHorizontal: 14, height: 48, fontSize: 16 },
+  deleteConfirm: { marginTop: 16, height: 48, borderRadius: 24, backgroundColor: '#E5484D', alignItems: 'center', justifyContent: 'center' },
   safe: { flex: 1 },
   scroll: { flex: 1 },
   scrollContent: { paddingHorizontal: 24, paddingTop: 16 },

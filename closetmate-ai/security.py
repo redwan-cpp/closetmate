@@ -254,3 +254,18 @@ def require_same_user(claimed_user_id: str, actual_user_id: str) -> None:
     """403 unless the user_id in a path/body matches the authenticated user."""
     if claimed_user_id != actual_user_id:
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Forbidden")
+
+
+def require_account(db, user_id: str) -> None:
+    """
+    401 unless the account still exists. Access tokens are verified without a database lookup and
+    outlive an account deletion by up to their 15-minute lifetime, so anything that CREATES rows
+    must check — otherwise a deleted account's token keeps adding data nobody can ever remove.
+    (401, not 403: the app reads it as "this session is over" and signs the user out.)
+    """
+    if db.execute(text("SELECT 1 FROM users WHERE user_id = :u"), {"u": user_id}).fetchone() is None:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="This account no longer exists",
+            headers={"WWW-Authenticate": "Bearer"},
+        )

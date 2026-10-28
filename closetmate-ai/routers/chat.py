@@ -31,6 +31,7 @@ from security import current_user_id, require_same_user
 from services.llm_gateway import gemini_generate, openai_chat
 from settings import get_settings
 from services.outfit_layout import look_meta, outfit_slot
+from services.photo_store import present
 from services.weather_service import (
     get_weather_by_city,
     get_weather_by_coords,
@@ -195,6 +196,7 @@ class SuggestedItem(BaseModel):
     color: str
     item_id: Optional[str] = None
     image_url: Optional[str] = None
+    thumb_url: Optional[str] = None   # small version (stored photos only)
     category: Optional[str] = None
     slot: Optional[str] = None      # outer | dress | top | bottom | shoes | accessory
 
@@ -603,11 +605,13 @@ async def _handle_chat(request: ChatRequest, uid: str) -> ChatResponse:
                 palette_colors.append(_known_colour(row.get("primary_color")))
             else:
                 palette_colors.append(_known_colour(item.color))
+            image_url, thumb_url = present(image_url)     # stored photos become short-lived links
             enriched.append(SuggestedItem(
                 subcategory=item.subcategory,
                 color=item.color,
                 item_id=resolved_item_id,
                 image_url=image_url,
+                thumb_url=thumb_url,
                 category=category,
                 slot=outfit_slot(category, (row.get("subcategory") if row else None) or item.subcategory),
             ))

@@ -195,7 +195,7 @@ class TestOutfitParsing:
         assert "<outfit>" not in body["reply"] and "item_id" not in body["reply"]
         assert body["suggested_items"] == [
             {"subcategory": "shirt", "color": "white", "item_id": shirt, "image_url": "uploads/processed/s.jpg",
-             "category": "top", "slot": "top"}
+             "thumb_url": None, "category": "top", "slot": "top"}
         ]
         # Alice has no skin tone and sent no weather: the card chips have nothing to state.
         assert body["look_meta"] == {"weather": None, "palette": None}

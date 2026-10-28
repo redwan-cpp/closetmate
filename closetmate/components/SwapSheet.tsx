@@ -99,6 +99,7 @@ export function SwapSheet({ visible, slot, userId, excludeIds, dark, onPick, onC
               <ItemCard
                 id={item.item_id}
                 uri={item.image_path}
+                thumb={item.thumb_url}
                 title={item.subcategory}
                 color={item.primary_color}
                 width={cardWidth}

@@ -8,6 +8,7 @@ POST   /auth/logout     revoke a refresh token
 GET    /auth/profile    the signed-in user's profile
 PATCH  /auth/profile    update body shape / skin tone
 GET    /auth/usage      this month's usage vs. limits (for the app's usage meter)
+POST   /auth/delete-account  erase the account and everything it owns (needs the password)
 
 Passwords are bcrypt-hashed. Access tokens are short-lived JWTs; refresh
 tokens are opaque, stored hashed, and rotate on every use (see security.py).
@@ -28,7 +29,8 @@ from database import get_db
 from models.profile import normalize_body_shape, normalize_skin_tone
 from models.user import User
 from quota import usage_summary
-from ratelimit import get_limiter, rate_limit_ip
+from ratelimit import get_limiter, rate_limit_ip, rate_limit_user
+from services.photo_store import delete_user_photos
 from security import (
     MAX_PASSWORD_BYTES,
     create_access_token,
@@ -108,6 +110,10 @@ class TokenResponse(BaseModel):
 
 class RefreshRequest(BaseModel):
     refresh_token: str = Field(min_length=20, max_length=200)
+
+
+class DeleteAccountRequest(BaseModel):
+    password: str = Field(min_length=1, max_length=128)
 
 
 class ProfileUpdateRequest(BaseModel):
@@ -271,6 +277,52 @@ def update_profile(
         text("SELECT * FROM users WHERE user_id = :user_id"), {"user_id": current_user.user_id}
     ).fetchone()
     return row_to_user(row)
+
+
+@router.post(
+    "/delete-account",
+    status_code=status.HTTP_204_NO_CONTENT,
+    dependencies=[Depends(rate_limit_user("delete_account", 5, 3600))],
+)
+def delete_account(
+    payload: DeleteAccountRequest,
+    user_id: str = Depends(current_user_id),
+    db: Any = Depends(get_db),
+) -> Response:
+    """
+    Erase the signed-in user's account and everything it owns: closet, photos, looks, wear
+    history, sessions and usage counters. The password is required so a stolen access token
+    alone can't do it. This cannot be undone.
+
+    AI usage rows are kept with the user id removed: they are our cost accounting, not the
+    user's data. (A wrong password is a 403, not a 401: the app treats 401 as "session expired".)
+    """
+    row = db.execute(text("SELECT password_hash FROM users WHERE user_id = :u"), {"u": user_id}).fetchone()
+    db.rollback()   # end the read transaction before the slow bcrypt compare (see register)
+    if row is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Account not found")
+    if not verify_password_or_dummy(payload.password, row["password_hash"]):
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Incorrect password")
+
+    # 1. The stored photos FIRST, while the account still exists. If storage is down the user simply
+    #    tries again: once the account is gone they could no longer sign in to retry, and the files
+    #    would stay behind with nobody able to ask for them to be removed.
+    try:
+        delete_user_photos(db, user_id)
+    except Exception:  # noqa: BLE001
+        log.exception("could not remove the stored photos of account %s", user_id)
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="We couldn't remove your photos just now, so nothing was deleted. Please try again in a moment.",
+        )
+
+    # 2. Then the rows, in one transaction: either the account is gone or nothing changed.
+    for table in ("refresh_tokens", "saved_looks", "worn_logs", "wardrobe_items", "usage_counters"):
+        db.execute(text(f"DELETE FROM {table} WHERE user_id = :u"), {"u": user_id})   # fixed table names
+    db.execute(text("UPDATE ai_usage SET user_id = NULL WHERE user_id = :u"), {"u": user_id})
+    db.execute(text("DELETE FROM users WHERE user_id = :u"), {"u": user_id})
+    db.commit()
+    return Response(status_code=status.HTTP_204_NO_CONTENT)
 
 
 @router.get("/usage")

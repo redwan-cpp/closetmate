@@ -15,6 +15,8 @@ import { ItemImage } from '@/components/ItemImage';
 interface Props {
   id: string;
   uri: string | null | undefined;
+  /** Server thumbnail (stored photos). */
+  thumb?: string | null;
   title?: string | null;
   color?: string | null;
   width: number;
@@ -30,7 +32,7 @@ const RADIUS = 22;
 const ENTER_MAX_INDEX = 14;
 
 export const ItemCard = memo(function ItemCard({
-  id, uri, title, color, width, dark, index = 0, onPress, onLongPress,
+  id, uri, thumb, title, color, width, dark, index = 0, onPress, onLongPress,
 }: Props) {
   const height = Math.round(width * 1.25);
   const enter = useRef(new Animated.Value(index < ENTER_MAX_INDEX ? 0 : 1)).current;
@@ -69,7 +71,7 @@ export const ItemCard = memo(function ItemCard({
         <View style={[Elevation.card, { width, height, borderRadius: RADIUS, backgroundColor: tint }]}>
           <View style={[styles.tile, { borderRadius: RADIUS, backgroundColor: tint }]}>
             <View style={[styles.imageWrap, legacy && styles.multiply]}>
-              <ItemImage uri={uri} style={StyleSheet.absoluteFill} contentFit="contain" />
+              <ItemImage uri={uri} thumbSrc={thumb} style={StyleSheet.absoluteFill} contentFit="contain" />
             </View>
           </View>
         </View>

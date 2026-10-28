@@ -231,7 +231,7 @@ class TestWornHistory:
         assert [i["item_id"] for i in logs[1]["items"]] == [jeans, shirt]       # log order, not DB order
         jeans_out = logs[1]["items"][0]
         assert jeans_out == {
-            "item_id": jeans, "image_path": "uploads/jeans.jpg", "category": "top",
+            "item_id": jeans, "image_path": "uploads/jeans.jpg", "thumb_url": None, "category": "top",
             "subcategory": "jeans", "primary_color": "blue",
             "slot": "bottom",                         # subcategory wins over the (wrong) category
         }

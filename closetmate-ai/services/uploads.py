@@ -7,6 +7,7 @@ helpers cap the size and reject empty bodies.
 """
 from __future__ import annotations
 
+import asyncio
 import io
 from typing import Optional
 
@@ -16,6 +17,11 @@ from PIL import Image, UnidentifiedImageError
 from settings import get_settings
 
 _CHUNK = 64 * 1024
+
+# Decoding a phone photo (or segmenting it) takes hundreds of MB at the top of the size range, and a
+# Cloud Run instance serves several requests at once. Two at a time per instance keeps a burst of
+# uploads from running it out of memory; the rest simply wait their turn.
+heavy_image_work = asyncio.Semaphore(2)
 
 
 async def read_upload(
@@ -57,7 +63,10 @@ def _check_image_header(data: bytes) -> None:
     try:
         with Image.open(io.BytesIO(data)) as img:
             width, height = img.size
-    except (UnidentifiedImageError, OSError, ValueError, Image.DecompressionBombError) as exc:
+    except (Image.DecompressionBombError, Image.DecompressionBombWarning) as exc:
+        # main.py turns the "suspiciously large" warning into an error: that is a size problem, not a crash.
+        raise HTTPException(status_code=413, detail="Image resolution too high") from exc
+    except (UnidentifiedImageError, OSError, ValueError) as exc:
         # Literal 422: the status-constant name changed between Starlette versions.
         raise HTTPException(status_code=422, detail="Cannot decode image") from exc
     if width * height > max_pixels:

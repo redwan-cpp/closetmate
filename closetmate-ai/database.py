@@ -195,6 +195,20 @@ def init_db() -> None:
             )
         """))
 
+        # Closet photos kept in object storage (see services/photo_store.py). One row per stored
+        # photo: it bounds each user's storage and lets account deletion and clean-up find
+        # everything. `key` / `thumb_key` are object keys, e.g. photos/<user_id>/<photo_id>.webp
+        conn.execute(text("""
+            CREATE TABLE IF NOT EXISTS photos (
+                photo_id    TEXT PRIMARY KEY,
+                user_id     TEXT NOT NULL,
+                key         TEXT NOT NULL,
+                thumb_key   TEXT NOT NULL,
+                size_bytes  INTEGER NOT NULL,
+                created_at  TEXT NOT NULL
+            )
+        """))
+
         # Outfits the user chose to keep ("Looks"). item_ids is a JSON array of item_id strings.
         conn.execute(text("""
             CREATE TABLE IF NOT EXISTS saved_looks (
@@ -225,6 +239,14 @@ def init_db() -> None:
             "CREATE INDEX IF NOT EXISTS idx_wardrobe_user ON wardrobe_items (user_id, created_at)",
             "CREATE INDEX IF NOT EXISTS idx_worn_user_date ON worn_logs (user_id, worn_date)",
             "CREATE INDEX IF NOT EXISTS idx_looks_user ON saved_looks (user_id, created_at)",
+            "CREATE INDEX IF NOT EXISTS idx_photos_user ON photos (user_id, created_at)",
+            # One stored photo backs at most one item, even when two requests race. The predicate
+            # is an equality on a prefix, never a < / >= range: Postgres orders text by the
+            # database collation (en_US ignores punctuation), so a range like
+            # `>= 'photos/' AND < 'photos0'` silently matches nothing there and the index would
+            # enforce nothing. SQLite compares bytes and would not have shown it.
+            "CREATE UNIQUE INDEX IF NOT EXISTS idx_items_photo ON wardrobe_items (image_path) "
+            "WHERE substr(image_path, 1, 7) = 'photos/'",
             "CREATE INDEX IF NOT EXISTS idx_refresh_user ON refresh_tokens (user_id)",
             "CREATE INDEX IF NOT EXISTS idx_ai_usage_created ON ai_usage (created_at)",
             "CREATE INDEX IF NOT EXISTS idx_ai_usage_user ON ai_usage (user_id, created_at)",

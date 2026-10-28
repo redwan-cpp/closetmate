@@ -109,6 +109,8 @@ export interface WardrobeItem {
   formality_level: string | null;
   cultural_style: string | null;
   image_path: string | null;
+  /** Small version for grids (stored photos only). */
+  thumb_url?: string | null;
   created_at: string;
 }
 
@@ -145,7 +147,11 @@ export async function getWardrobeItems(userId: string): Promise<WardrobeItem[]> 
   );
   const items = (await res.json()) as WardrobeItem[];
   // Resolve relative image paths so <Image> can load them.
-  return items.map((item) => ({ ...item, image_path: resolveImageUrl(item.image_path) }));
+  return items.map((item) => ({
+    ...item,
+    image_path: resolveImageUrl(item.image_path),
+    thumb_url: resolveImageUrl(item.thumb_url),
+  }));
 }
 
 /** DELETE /wardrobe/item/{itemId} */
@@ -187,7 +193,18 @@ export async function removeBackground(uri: string): Promise<string> {
   return `data:image/jpeg;base64,${json.image}`;
 }
 
-export interface StudioShotResult {
+/** A photo kept in the user's private cloud storage (see backend services/photo_store.py). */
+export interface StoredPhoto {
+  /** Save THIS on the item (add-item / replaceItemImage): the permanent key, e.g. "photos/<user>/<id>.webp". */
+  imagePath: string;
+  /** Needed to discard the photo again if it never becomes part of an item. */
+  photoId: string;
+  /** Short-lived links for showing it right now (already resolved against the backend URL). */
+  imageUrl: string | null;
+  thumbUrl: string | null;
+}
+
+export interface StudioShotResult extends Partial<StoredPhoto> {
   /** `data:image/webp;base64,…` — 640×800, transparent background. */
   image: string;
   /** Same picture at 320×400, for grids. */
@@ -196,20 +213,31 @@ export interface StudioShotResult {
   cutoutOk: boolean;
 }
 
+function parseStoredPhoto(json: Record<string, unknown>): StoredPhoto | null {
+  if (typeof json.image_path !== 'string' || typeof json.photo_id !== 'string') return null;
+  return {
+    imagePath: json.image_path,
+    photoId: json.photo_id,
+    imageUrl: resolveImageUrl(typeof json.image_url === 'string' ? json.image_url : null),
+    thumbUrl: resolveImageUrl(typeof json.thumb_url === 'string' ? json.thumb_url : null),
+  };
+}
+
 /**
  * POST /studio-shot — a clean, centred cutout on a transparent 4:5 canvas, plus a thumbnail.
  * This is what makes the closet look like a boutique shelf instead of a camera roll.
  * Counts toward the background-removal quota.
+ *
+ * With `store: true` the server also keeps the result in the user's private storage and the
+ * result carries `imagePath` / `photoId` — the app never has to hold the only copy of a photo.
  */
-export async function studioShot(uri: string): Promise<StudioShotResult> {
+export async function studioShot(uri: string, opts: { store?: boolean } = {}): Promise<StudioShotResult> {
   const res = await request(
-    `${AI_BASE_URL}/studio-shot`,
+    `${AI_BASE_URL}/studio-shot${opts.store ? '?store=1' : ''}`,
     { method: 'POST', body: buildImageFormData(uri), timeoutMs: 60_000 },
     'Could not prepare this photo'
   );
-  const json = (await res.json()) as {
-    image?: unknown; thumb?: unknown; mime?: unknown; cutout_ok?: unknown;
-  };
+  const json = (await res.json()) as Record<string, unknown>;
   if (typeof json.image !== 'string' || typeof json.thumb !== 'string' || !json.image || !json.thumb) {
     throw new Error('The server returned an empty image. Please try again.');
   }
@@ -218,27 +246,29 @@ export async function studioShot(uri: string): Promise<StudioShotResult> {
     image: `data:${mime};base64,${json.image}`,
     thumb: `data:${mime};base64,${json.thumb}`,
     cutoutOk: json.cutout_ok !== false,
+    ...(opts.store ? (parseStoredPhoto(json) ?? {}) : {}),
   };
 }
 
-export interface UploadClothingResult {
-  /** Server path or storage URL, e.g. "uploads/processed/abc123.jpg" or "https://storage.googleapis.com/…" */
-  image_path: string;
-  status: string;
+/** POST /photos — keep a photo (any image) in private storage. Strips location data and makes a thumbnail. */
+export async function uploadPhoto(uri: string): Promise<StoredPhoto> {
+  const res = await request(
+    `${AI_BASE_URL}/photos`,
+    { method: 'POST', body: buildImageFormData(uri), timeoutMs: 60_000 },
+    'Could not save this photo'
+  );
+  const stored = parseStoredPhoto((await res.json()) as Record<string, unknown>);
+  if (!stored) throw new Error('The server did not return a photo. Please try again.');
+  return stored;
 }
 
-/**
- * POST /upload/upload-clothing — server-side background removal + durable storage
- * (GCS in production). Not used by the add-item screen yet; it is the path to
- * photos that survive a reinstall (see the photo-storage phase).
- */
-export async function uploadClothing(uri: string): Promise<UploadClothingResult> {
-  const res = await request(
-    `${AI_BASE_URL}/upload/upload-clothing`,
-    { method: 'POST', body: buildImageFormData(uri), timeoutMs: 60_000 },
-    'Upload failed'
-  );
-  return (await res.json()) as UploadClothingResult;
+/** DELETE /photos/{id} — discard a stored photo that never became part of an item. Best effort. */
+export async function discardPhoto(photoId: string): Promise<void> {
+  try {
+    await request(`${AI_BASE_URL}/photos/${encodeURIComponent(photoId)}`, { method: 'DELETE', timeoutMs: 20_000 }, 'Could not discard the photo');
+  } catch {
+    // A leftover is harmless: the server's clean-up finds photos that no item uses.
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -255,6 +285,7 @@ export interface SuggestedOutfitItem {
   color: string;
   item_id?: string | null;
   image_url?: string | null;
+  thumb_url?: string | null;
   category?: string | null;
   slot?: Slot | null;
 }
@@ -376,6 +407,7 @@ export interface WornHistoryItem {
   item_id: string;
   slot?: Slot;
   image_path: string | null;
+  thumb_url?: string | null;
   category: string | null;
   subcategory: string | null;
   primary_color: string | null;
@@ -397,7 +429,11 @@ export async function getWornHistory(userId: string, limit = 7): Promise<WornLog
   const logs = (await res.json()) as WornLog[];
   return logs.map((entry) => ({
     ...entry,
-    items: entry.items.map((item) => ({ ...item, image_path: resolveImageUrl(item.image_path) })),
+    items: entry.items.map((item) => ({
+      ...item,
+      image_path: resolveImageUrl(item.image_path),
+      thumb_url: resolveImageUrl(item.thumb_url),
+    })),
   }));
 }
 
@@ -416,6 +452,7 @@ export interface StyleInsights {
 export interface LookItemData {
   item_id: string;
   image_path: string | null;
+  thumb_url?: string | null;
   category: string | null;
   subcategory: string | null;
   primary_color: string | null;
@@ -454,7 +491,11 @@ export async function getLooks(userId: string): Promise<Look[]> {
   const looks = (await res.json()) as Look[];
   return looks.map((look) => ({
     ...look,
-    items: look.items.map((item) => ({ ...item, image_path: resolveImageUrl(item.image_path) })),
+    items: look.items.map((item) => ({
+      ...item,
+      image_path: resolveImageUrl(item.image_path),
+      thumb_url: resolveImageUrl(item.thumb_url),
+    })),
   }));
 }
 

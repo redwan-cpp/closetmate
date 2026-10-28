@@ -15,7 +15,9 @@ creates rows of its own (random e-mail addresses) and deletes them again at the 
 Covers: concurrent schema bootstrap (advisory lock), the unique e-mail index, refresh-token
 rotation and reuse, expanding IN-queries, the `ON CONFLICT ... WHERE` quota upsert under
 contention, refunds, the saved-looks lock (Postgres advisory lock alone, thread lock alone and a
-no-lock control that must misbehave), and a real studio-shot request through the whole stack.
+no-lock control that must misbehave), a real studio-shot request through the whole stack, and the
+private photo storage: the one-photo-one-item partial unique index (including a concurrent race),
+per-user photo and byte caps, link-served files, and account deletion.
 """
 from __future__ import annotations
 
@@ -108,10 +110,11 @@ def bootstrap_checks() -> None:
         tables = {r[0] for r in conn.execute(text("SELECT tablename FROM pg_tables WHERE schemaname = 'public'"))}
         indexes = {r[0] for r in conn.execute(text("SELECT indexname FROM pg_indexes WHERE schemaname = 'public'"))}
     expected_tables = {"users", "wardrobe_items", "worn_logs", "refresh_tokens", "usage_counters",
-                       "ai_usage", "clothing_metadata_cache", "saved_looks"}
+                       "ai_usage", "clothing_metadata_cache", "saved_looks", "photos"}
     check("every table exists", expected_tables <= tables, f"missing {sorted(expected_tables - tables)}")
-    check("indexes exist (case-insensitive e-mail key, looks)",
-          {"users_email_lower_key", "idx_looks_user"} <= indexes, f"have {sorted(indexes)}")
+    check("indexes exist (case-insensitive e-mail key, looks, photos, one-photo-one-item)",
+          {"users_email_lower_key", "idx_looks_user", "idx_photos_user", "idx_items_photo"} <= indexes,
+          f"have {sorted(indexes)}")
     engine.dispose()
 
 
@@ -120,6 +123,8 @@ def bootstrap_checks() -> None:
 # ---------------------------------------------------------------------------
 
 def run_app_checks() -> None:
+    import tempfile
+
     import database
     import quota
     import routers.wardrobe as wardrobe
@@ -129,6 +134,11 @@ def run_app_checks() -> None:
     from sqlalchemy import text
 
     import main
+    from services import photo_store
+
+    # Photos go to a throw-away folder, never the real photo_store/.
+    photo_root = tempfile.TemporaryDirectory(prefix="pg-smoke-photos-")
+    photo_store.set_store(photo_store.DiskStore(Path(photo_root.name)))
 
     created_users: list[str] = []
 
@@ -340,12 +350,133 @@ def run_app_checks() -> None:
             check("a photo with no garment is a 422 that doesn't cost the user a unit",
                   blank.status_code == 422 and now_bg == used_bg, f"{blank.status_code} used {used_bg}→{now_bg}")
 
+        # --- private photo storage ----------------------------------------------
+        def png(colour) -> bytes:
+            buf = io.BytesIO()
+            Image.new("RGB", (60, 80), colour).save(buf, format="PNG")
+            return buf.getvalue()
+
+        def upload(user: dict, colour=(10, 20, 30)):
+            return client.post("/photos", headers=user["h"], files={"file": ("p.png", png(colour), "image/png")})
+
+        def item_with(user: dict, image_path: str):
+            return client.post("/wardrobe/add-item", headers=user["h"], json={
+                "user_id": user["uid"], "image_path": image_path, "category": "top", "subcategory": "tee",
+                "primary_color": "white", "material": "cotton", "pattern": "solid", "formality": "casual",
+                "culture": "western"})
+
+        up = upload(alice)
+        stored = up.json() if up.status_code == 201 else {}
+        check("a photo uploads and is recorded", up.status_code == 201 and len(sql(
+            "SELECT 1 FROM photos WHERE user_id = :u AND key = :k", u=alice["uid"], k=stored.get("image_path"))) == 1,
+              f"{up.status_code} {up.text[:160]}")
+
+        link = client.get("/" + stored["image_url"].lstrip("/")) if stored else None
+        check("its signed link serves the bytes with an immutable cache header",
+              link is not None and link.status_code == 200 and "immutable" in link.headers.get("cache-control", ""),
+              f"{link.status_code if link is not None else None}")
+        forged = client.get(f"/files/{stored['image_path']}?e=9999999999&s=AAAA") if stored else None
+        check("a forged signature is refused", forged is not None and forged.status_code == 403,
+              f"{forged.status_code if forged is not None else None}")
+
+        first = item_with(alice, stored.get("image_path", ""))
+        second = item_with(alice, stored.get("image_path", ""))
+        check("one stored photo can back only one item (second use is a clean 409)",
+              first.status_code == 201 and second.status_code == 409, f"{first.status_code}/{second.status_code} {second.text[:120]}")
+        check("a legacy path is still accepted any number of times",
+              item_with(alice, "uploads/processed/old.jpg").status_code == 201
+              and item_with(alice, "uploads/processed/old.jpg").status_code == 201)
+        stolen = item_with(bob, stored.get("image_path", ""))
+        check("another user cannot attach my photo (404, same as a missing one)", stolen.status_code == 404,
+              f"{stolen.status_code} {stolen.text[:120]}")
+
+        # The partial unique index itself, with the application check bypassed (the race it exists for).
+        racer = upload(alice, (200, 10, 10)).json()
+        racing_id = uuid.uuid4().hex
+
+        def insert_item(n: int) -> str:
+            try:
+                sql("INSERT INTO wardrobe_items (item_id, user_id, category, image_path, created_at) "
+                    "VALUES (:i, :u, 'top', :p, '2026-10-01T00:00:00+00:00')",
+                    i=f"{racing_id[:28]}-{n:03d}", u=alice["uid"], p=racer["image_path"])
+                return "ok"
+            except Exception as exc:  # noqa: BLE001
+                return type(exc).__name__
+
+        with ThreadPoolExecutor(6) as pool:
+            outcomes = sorted(pool.map(insert_item, range(6)))
+        check("six simultaneous inserts of one photo key: exactly one wins (partial unique index)",
+              outcomes.count("ok") == 1 and outcomes.count("IntegrityError") == 5, str(outcomes))
+        sql("DELETE FROM wardrobe_items WHERE image_path = :p", p=racer["image_path"])
+        check("the index leaves ordinary image paths alone",
+              len(sql("SELECT 1 FROM wardrobe_items WHERE image_path = 'uploads/processed/old.jpg' AND user_id = :u",
+                      u=alice["uid"])) >= 2)
+
+        # An unattached photo can be discarded; one that belongs to an item cannot; deleting the item removes it.
+        spare = upload(alice, (5, 200, 5)).json()
+        check("an unattached photo can be discarded",
+              client.delete(f"/photos/{spare['photo_id']}", headers=alice["h"]).status_code == 200
+              and sql("SELECT 1 FROM photos WHERE photo_id = :p", p=spare["photo_id"]) == [])
+        check("a photo that belongs to an item cannot be discarded (409)",
+              client.delete(f"/photos/{stored['photo_id']}", headers=alice["h"]).status_code == 409)
+        check("another user cannot discard it either (404)",
+              client.delete(f"/photos/{stored['photo_id']}", headers=bob["h"]).status_code == 404)
+        item_id = first.json()["item_id"] if first.status_code == 201 else ""
+        gone = client.delete(f"/wardrobe/item/{item_id}", headers=alice["h"])
+        check("deleting the item also deletes its photo",
+              gone.status_code == 200 and photo_store.get_store().get(stored["image_path"]) is None
+              and sql("SELECT 1 FROM photos WHERE photo_id = :p", p=stored["photo_id"]) == [],
+              f"{gone.status_code} {gone.text[:120]}")
+
+        # Caps: COUNT(*) and COALESCE(SUM(size_bytes), 0) are the Postgres-typed parts.
+        set_env(MAX_PHOTOS_PER_USER="2")
+        codes = [upload(bob, (i, 0, 0)).status_code for i in range(3)]
+        check("photo count cap: the third upload is a 403 photos_full", codes == [201, 201, 403], str(codes))
+        set_env(MAX_PHOTOS_PER_USER="")
+        set_env(MAX_PHOTO_BYTES_PER_USER="300")
+        over = upload(bob, (9, 9, 9))
+        check("byte cap: an upload that would exceed it is a 403 photos_full",
+              over.status_code == 403 and over.json()["detail"]["code"] == "photos_full",
+              f"{over.status_code} {over.text[:120]}")
+        set_env(MAX_PHOTO_BYTES_PER_USER="")
+
+        # Account deletion on Postgres: every table, the stored files, ai_usage kept anonymously.
+        victim = account("victim")
+        kept = upload(victim).json()
+        item_with(victim, kept["image_path"])
+        item_with(victim, "uploads/processed/legacy.jpg")
+        victims_items = client.get(f"/wardrobe/items/{victim['uid']}", headers=victim["h"]).json()
+        client.post("/wardrobe/looks", headers=victim["h"],
+                    json={"user_id": victim["uid"], "item_ids": [i["item_id"] for i in victims_items]})
+        sql("INSERT INTO ai_usage (user_id, feature, provider, model, ok, created_at) "
+            "VALUES (:u, 'chat', 'openai', 'smoke-m', 1, '2026-10-01T00:00:00+00:00')", u=victim["uid"])
+        bobs_photos = sql("SELECT COUNT(*) AS n FROM photos WHERE user_id = :u", u=bob["uid"])[0]["n"]
+        wrong = client.post("/auth/delete-account", headers=victim["h"], json={"password": "nope-nope-nope"})
+        check("delete-account with a wrong password is a 403 and deletes nothing",
+              wrong.status_code == 403 and len(sql("SELECT 1 FROM users WHERE user_id = :u", u=victim["uid"])) == 1)
+        done = client.post("/auth/delete-account", headers=victim["h"], json={"password": "smoke-pass-12345"})
+        left = {t: sql(f"SELECT COUNT(*) AS n FROM {t} WHERE user_id = :u", u=victim["uid"])[0]["n"]
+                for t in ("users", "wardrobe_items", "saved_looks", "photos", "refresh_tokens", "usage_counters")}
+        check("delete-account removes the account and everything it owns",
+              done.status_code == 204 and not any(left.values()), f"{done.status_code} {left}")
+        check("…including the stored files", photo_store.get_store().get(kept["image_path"]) is None)
+        anon = sql("SELECT user_id FROM ai_usage WHERE model = 'smoke-m'")
+        check("…while ai_usage rows stay for cost accounting, without the user id",
+              bool(anon) and all(r["user_id"] is None for r in anon), str(anon))
+        sql("DELETE FROM ai_usage WHERE model = 'smoke-m'")
+        check("…and another user's photos are untouched",
+              sql("SELECT COUNT(*) AS n FROM photos WHERE user_id = :u", u=bob["uid"])[0]["n"] == bobs_photos)
+        ghost = client.post("/photos", headers=victim["h"], files={"file": ("p.png", png((1, 2, 3)), "image/png")})
+        check("the deleted account's old token cannot create anything (401)", ghost.status_code == 401, str(ghost.status_code))
+
     # --- cleanup: only what this run created ------------------------------------
-    for table in ("saved_looks", "worn_logs", "wardrobe_items", "refresh_tokens", "usage_counters", "ai_usage", "users"):
+    for table in ("saved_looks", "worn_logs", "wardrobe_items", "photos", "refresh_tokens", "usage_counters", "ai_usage", "users"):
         for uid in created_users:
             sql(f"DELETE FROM {table} WHERE user_id = :u", u=uid)
     sql("DELETE FROM usage_counters WHERE user_id = '__global__' AND feature = 'ai_calls' AND period LIKE 'smoke-%'")
     database.engine.dispose()
+    photo_store.set_store(None)
+    photo_root.cleanup()
 
 
 def main() -> int:

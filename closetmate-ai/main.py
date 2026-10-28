@@ -33,7 +33,7 @@ from fastapi.staticfiles import StaticFiles  # noqa: E402
 from PIL import Image  # noqa: E402
 
 from database import init_db, ping_db  # noqa: E402
-from routers import auth, chat, images, recommend, skin_tone, upload, wardrobe  # noqa: E402
+from routers import auth, chat, files, images, photos, recommend, skin_tone, upload, wardrobe  # noqa: E402
 from security import current_user_id  # noqa: E402
 from services.image_processing import prewarm_rembg  # noqa: E402
 
@@ -176,12 +176,16 @@ app.include_router(chat.router, prefix="/chat", tags=["Chat"], dependencies=_aut
 app.include_router(images.router, prefix="/images", tags=["Images"], dependencies=_authed)
 # Root-level aliases: older app builds call /remove-bg directly.
 app.include_router(images.router, prefix="", tags=["Images (root aliases)"], dependencies=_authed)
+app.include_router(photos.router, prefix="/photos", tags=["Photos"], dependencies=_authed)
+# Public by design: closet photos are private objects, and a link signed by the API (an HMAC over the
+# key + expiry, handed only to the owner) is the proof of access. IP rate-limited. See routers/files.py.
+app.include_router(files.router, prefix="/files", tags=["Files"])
 # Public by design: used during registration, before an account exists (IP rate-limited).
 app.include_router(skin_tone.router, prefix="", tags=["Skin Tone"])
 
-# Locally-stored processed images: a dev/fallback convenience. Once production stores
-# images in GCS there is nothing to serve from disk, so the mount is not exposed at all.
-if not (_settings.is_prod and os.getenv("GCS_BUCKET")):
+# Locally-stored legacy images (uploads/…): a dev convenience only. Production always has a
+# bucket (settings refuses to boot without one), so nothing is served from disk there.
+if not _settings.is_prod:
     _uploads_dir = os.path.join(os.path.dirname(__file__), "uploads")
     os.makedirs(_uploads_dir, exist_ok=True)
     app.mount("/uploads", StaticFiles(directory=_uploads_dir), name="uploads")

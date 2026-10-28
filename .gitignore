@@ -18,6 +18,7 @@ closetmate-ai/*.pyc
 closetmate-ai/.env
 closetmate-ai/closetmate.db
 closetmate-ai/uploads/
+closetmate-ai/photo_store/
 closetmate-ai/.coverage
 closetmate-ai/.pytest_cache/
 closetmate-ai/htmlcov/

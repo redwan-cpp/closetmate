@@ -29,12 +29,14 @@ from urllib.parse import unquote
 from fastapi import APIRouter, Depends, HTTPException, Query, Response, status
 from pydantic import BaseModel, Field, field_validator
 from sqlalchemy import bindparam, text
+from sqlalchemy.exc import IntegrityError
 
 from database import engine, get_db
 from quota import metered
 from ratelimit import rate_limit_user
-from security import current_user_id, require_same_user
+from security import current_user_id, require_account, require_same_user
 from services.outfit_layout import outfit_slot
+from services.photo_store import delete_photo, key_owner, owns_photo, present
 from services.recommendation_engine import ai_refine_outfits, build_outfits, get_weather_category
 from settings import get_settings
 
@@ -46,14 +48,18 @@ router = APIRouter()
 # Pydantic models
 # ─────────────────────────────────────────────
 
-_IMAGE_PATH_RE = re.compile(r"^(file://|content://|uploads/|https://storage\.googleapis\.com/)")
+_IMAGE_PATH_RE = re.compile(r"^(file://|content://|uploads/|photos/|https://storage\.googleapis\.com/)")
 
 
 def _checked_image_path(value: str) -> str:
     """Shared by every payload that carries an image location (add-item, replace-image)."""
     # The app renders this as an image URI, so don't let it point at arbitrary hosts.
     if not _IMAGE_PATH_RE.match(value):
-        raise ValueError("image_path must be a device file, an uploads/ path or a storage URL")
+        raise ValueError("image_path must be a device file, a stored photo, an uploads/ path or a storage URL")
+    # photos/… is OUR private storage: only a well-formed, full-size photo key is acceptable (the
+    # strict pattern is also what rules out traversal there). Whose photo it is gets checked later.
+    if value.startswith("photos/") and key_owner(value) is None:
+        raise ValueError("image_path is not a valid photo key")
     # The app renders BACKEND_URL + "/" + path for uploads/ values: forbid ".." so
     # "uploads/../health" can't make it request an arbitrary same-origin URL.
     # Percent-decode first (twice, for double encoding): URL parsers treat "%2e%2e" as "..".
@@ -102,7 +108,8 @@ class WardrobeItemOut(BaseModel):
     pattern: Optional[str]
     formality_level: Optional[str]
     cultural_style: Optional[str]
-    image_path: Optional[str]
+    image_path: Optional[str]     # for stored photos: a short-lived link, not the key
+    thumb_url: Optional[str] = None   # small version (stored photos only)
     created_at: str
     slot: str = "accessory"       # outer | dress | top | bottom | shoes | accessory (see outfit_layout)
 
@@ -136,8 +143,25 @@ def get_wardrobe_items(
     for row in rows:
         item = dict(row._mapping)
         item["slot"] = outfit_slot(item.get("category"), item.get("subcategory"))
+        item["image_path"], item["thumb_url"] = present(item.get("image_path"))
         items.append(item)
     return items
+
+
+PHOTO_TAKEN = "That photo already belongs to another item"
+
+
+def _require_attachable_photo(db: Any, uid: str, path: str, item_id: str) -> None:
+    """A stored photo may only be attached by its owner, and to one item at a time."""
+    if not path.startswith("photos/"):
+        return
+    if not owns_photo(db, uid, path):
+        raise HTTPException(status_code=404, detail="Photo not found")     # someone else's looks missing
+    taken = db.execute(
+        text("SELECT 1 FROM wardrobe_items WHERE image_path = :p AND item_id != :i"), {"p": path, "i": item_id}
+    ).fetchone()
+    if taken:
+        raise HTTPException(status_code=409, detail=PHOTO_TAKEN)
 
 
 # ─────────────────────────────────────────────
@@ -156,6 +180,7 @@ def add_wardrobe_item(
 ):
     """Save a new clothing item to the authenticated user's wardrobe."""
     require_same_user(payload.user_id, uid)
+    require_account(db, uid)
 
     # Bounds storage and — because the wardrobe is sent to the LLM — prompt size per call.
     limit = get_settings().max_wardrobe_items
@@ -170,30 +195,35 @@ def add_wardrobe_item(
         )
 
     item_id = str(uuid.uuid4())
+    _require_attachable_photo(db, uid, payload.image_path, item_id)
 
-    db.execute(
-        text("""
-        INSERT INTO wardrobe_items
-          (item_id, user_id, category, subcategory, primary_color,
-           material, pattern, formality_level, cultural_style, image_path, created_at)
-        VALUES (:item_id, :user_id, :category, :subcategory, :primary_color,
-                :material, :pattern, :formality, :culture, :image_path, :created_at)
-        """),
-        {
-            "item_id": item_id,
-            "user_id": uid,
-            "category": payload.category,
-            "subcategory": payload.subcategory,
-            "primary_color": payload.primary_color,
-            "material": payload.material,
-            "pattern": payload.pattern,
-            "formality": payload.formality,
-            "culture": payload.culture,
-            "image_path": payload.image_path,
-            "created_at": datetime.now(timezone.utc).isoformat(),
-        },
-    )
-    db.commit()
+    try:
+        db.execute(
+            text("""
+            INSERT INTO wardrobe_items
+              (item_id, user_id, category, subcategory, primary_color,
+               material, pattern, formality_level, cultural_style, image_path, created_at)
+            VALUES (:item_id, :user_id, :category, :subcategory, :primary_color,
+                    :material, :pattern, :formality, :culture, :image_path, :created_at)
+            """),
+            {
+                "item_id": item_id,
+                "user_id": uid,
+                "category": payload.category,
+                "subcategory": payload.subcategory,
+                "primary_color": payload.primary_color,
+                "material": payload.material,
+                "pattern": payload.pattern,
+                "formality": payload.formality,
+                "culture": payload.culture,
+                "image_path": payload.image_path,
+                "created_at": datetime.now(timezone.utc).isoformat(),
+            },
+        )
+        db.commit()
+    except IntegrityError:
+        db.rollback()                 # the unique index on stored photos: someone else got there first
+        raise HTTPException(status_code=409, detail=PHOTO_TAKEN)
     return {"status": "success", "item_id": item_id}
 
 
@@ -216,13 +246,27 @@ def replace_item_image(
     studio shot). Only the photo changes; the item keeps its id, so saved looks and wear history
     stay intact. Scoped by user_id: someone else's item looks exactly like a missing one (404).
     """
-    result = db.execute(
-        text("UPDATE wardrobe_items SET image_path = :image_path WHERE item_id = :item_id AND user_id = :uid"),
-        {"image_path": payload.image_path, "item_id": item_id, "uid": uid},
-    )
-    db.commit()
-    if result.rowcount == 0:
+    current = db.execute(
+        text("SELECT image_path FROM wardrobe_items WHERE item_id = :item_id AND user_id = :uid"),
+        {"item_id": item_id, "uid": uid},
+    ).fetchone()
+    if current is None:
         raise HTTPException(status_code=404, detail="Item not found")
+    _require_attachable_photo(db, uid, payload.image_path, item_id)
+
+    try:
+        result = db.execute(
+            text("UPDATE wardrobe_items SET image_path = :image_path WHERE item_id = :item_id AND user_id = :uid"),
+            {"image_path": payload.image_path, "item_id": item_id, "uid": uid},
+        )
+        db.commit()
+    except IntegrityError:
+        db.rollback()
+        raise HTTPException(status_code=409, detail=PHOTO_TAKEN)
+    if result.rowcount == 0:                     # deleted between the read and the write
+        raise HTTPException(status_code=404, detail="Item not found")
+    if current["image_path"] != payload.image_path:
+        delete_photo(db, uid, current["image_path"])      # the replaced photo, if it was ours
     return {"status": "updated", "item_id": item_id}
 
 
@@ -238,6 +282,10 @@ def delete_wardrobe_item(
 ):
     """Permanently delete one of the authenticated user's items."""
     # Scoped by user_id: someone else's item looks exactly like a missing one (404).
+    row = db.execute(
+        text("SELECT image_path FROM wardrobe_items WHERE item_id = :item_id AND user_id = :uid"),
+        {"item_id": item_id, "uid": uid},
+    ).fetchone()
     result = db.execute(
         text("DELETE FROM wardrobe_items WHERE item_id = :item_id AND user_id = :uid"),
         {"item_id": item_id, "uid": uid},
@@ -245,6 +293,8 @@ def delete_wardrobe_item(
     db.commit()
     if result.rowcount == 0:
         raise HTTPException(status_code=404, detail="Item not found")
+    if row is not None:
+        delete_photo(db, uid, row["image_path"])         # its stored photo goes with it
     return {"status": "deleted", "item_id": item_id}
 
 
@@ -316,6 +366,7 @@ def log_worn_outfit(
 ):
     """Record that the user is wearing a specific outfit today."""
     require_same_user(payload.user_id, uid)
+    require_account(db, uid)
 
     # Only items that really belong to this user may be logged.
     owned_rows = db.execute(
@@ -353,9 +404,16 @@ def log_worn_outfit(
 # GET /wardrobe/worn-history/{user_id}
 # ─────────────────────────────────────────────
 
+def _image_fields(path: Optional[str]) -> dict:
+    """image_path (a link for stored photos, unchanged for legacy paths) + thumb_url."""
+    image, thumb = present(path)
+    return {"image_path": image, "thumb_url": thumb}
+
+
 class WornItem(BaseModel):
     item_id: str
     image_path: Optional[str]
+    thumb_url: Optional[str] = None
     category: Optional[str]
     subcategory: Optional[str]
     primary_color: Optional[str]
@@ -415,7 +473,7 @@ def get_worn_history(
             items=[
                 WornItem(
                     item_id=w["item_id"],
-                    image_path=w["image_path"],
+                    **_image_fields(w["image_path"]),
                     category=w["category"],
                     subcategory=w["subcategory"],
                     primary_color=w["primary_color"],
@@ -442,6 +500,7 @@ class SaveLookPayload(BaseModel):
 class LookItem(BaseModel):
     item_id: str
     image_path: Optional[str]
+    thumb_url: Optional[str] = None
     category: Optional[str]
     subcategory: Optional[str]
     primary_color: Optional[str]
@@ -495,6 +554,7 @@ def save_look(
 ):
     """Keep an outfit. Saving the same set of items twice returns the existing look (HTTP 200)."""
     require_same_user(payload.user_id, uid)
+    require_account(db, uid)
 
     owned = _owned_items(db, uid, payload.item_ids)
     item_ids = [i for i in dict.fromkeys(payload.item_ids) if i in owned]   # de-dupe, keep order
@@ -567,17 +627,17 @@ def list_looks(
     items = _owned_items(db, uid, wanted)
     result = []
     for row, ids in parsed:
-        present = [
+        shown = [
             LookItem(
-                item_id=r["item_id"], image_path=r["image_path"], category=r["category"],
+                item_id=r["item_id"], **_image_fields(r["image_path"]), category=r["category"],
                 subcategory=r["subcategory"], primary_color=r["primary_color"],
                 slot=outfit_slot(r["category"], r["subcategory"]),
             )
             for r in (items.get(i) for i in ids) if r is not None
         ]
-        if present:     # a look whose pieces were all deleted has nothing left to show
+        if shown:       # a look whose pieces were all deleted has nothing left to show
             result.append(LookOut(look_id=row["look_id"], name=row["name"],
-                                  created_at=str(row["created_at"]), items=present))
+                                  created_at=str(row["created_at"]), items=shown))
     return result
 
 

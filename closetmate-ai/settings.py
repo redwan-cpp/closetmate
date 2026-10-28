@@ -109,6 +109,11 @@ class Settings:
     chat_wardrobe_limit: int         # most-recent items sent to the LLM per message
     global_daily_ai_calls: int       # 0 = off. Hard stop on total metered AI calls per UTC day
 
+    gcs_bucket: str                  # private bucket for closet photos; "" = local disk (dev/test only)
+    photo_url_ttl_seconds: int       # how long a signed photo link stays valid
+    max_photos_per_user: int         # stored photos (full + thumbnail count as one)
+    max_photo_bytes_per_user: int    # total stored bytes per user (full + thumbnails)
+
     quota_free: Dict[str, int]       # feature -> monthly limit for the free plan
 
     @property
@@ -132,6 +137,10 @@ class Settings:
                     "JWT_SECRET must be set to a random string of at least "
                     f"{_MIN_JWT_SECRET_LEN} characters in production."
                 )
+            if not self.gcs_bucket:
+                # Without a bucket photos land on the container's disk, which Cloud Run wipes on
+                # every restart and which is not shared between instances.
+                raise RuntimeError("GCS_BUCKET must be set in production (a private bucket for closet photos).")
         elif self.jwt_secret == _DEV_JWT_SECRET:
             log.warning("Using the built-in dev JWT secret — set JWT_SECRET before deploying.")
 
@@ -207,6 +216,13 @@ def get_settings() -> Settings:
         max_wardrobe_items=_int("MAX_WARDROBE_ITEMS", 500),
         chat_wardrobe_limit=_int("CHAT_WARDROBE_LIMIT", 200),
         global_daily_ai_calls=_int("GLOBAL_DAILY_AI_CALLS", 20_000 if strict else 0),
+        gcs_bucket=os.getenv("GCS_BUCKET", "").strip(),
+        # Links are signed per request; 6 h keeps a session's images working without a refetch.
+        photo_url_ttl_seconds=_int("PHOTO_URL_TTL_SECONDS", 6 * 3600),
+        # A bit above the closet cap: a replaced photo is deleted right away, so this is slack.
+        max_photos_per_user=_int("MAX_PHOTOS_PER_USER", _int("MAX_WARDROBE_ITEMS", 500) + 100),
+        # A cutout is ~50 KB with its thumbnail, a kept original ~300 KB: this fits a full closet of either.
+        max_photo_bytes_per_user=_int("MAX_PHOTO_BYTES_PER_USER", 250 * 1024 * 1024),
         quota_free=quota_free,
     )
 

@@ -146,6 +146,21 @@ export async function updateProfile(payload: ProfileUpdatePayload): Promise<User
   return res.json() as Promise<UserProfile>;
 }
 
+/**
+ * POST /auth/delete-account — erase the account and everything it owns (closet, photos, looks,
+ * history). The password is required; a wrong one is an ordinary error, not a sign-out.
+ * Cannot be undone.
+ */
+export async function deleteAccount(password: string): Promise<void> {
+  const res = await authFetch(`${AI_BASE_URL}/auth/delete-account`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ password }),
+    timeoutMs: 60_000,   // it removes every stored photo too
+  });
+  if (!res.ok) throw await toApiError(res, 'Could not delete your account');
+}
+
 // ─────────────────────────────────────────────
 // Skin-tone detection — POST /analyze-skin-tone (public: used before an account exists)
 // ─────────────────────────────────────────────

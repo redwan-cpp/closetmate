@@ -21,6 +21,9 @@ const WEBP_THUMB = /_t\.webp(\?.*)?$/i;
  */
 export function thumbUri(uri: string | null | undefined): string | null {
   if (!uri) return null;
+  // A link to a stored photo carries a signature that covers exactly that file, so the guess
+  // below would 403. Those thumbnails come from the server (thumb_url), never from a naming rule.
+  if (uri.includes('?')) return uri;
   if (WEBP.test(uri) && !WEBP_THUMB.test(uri)) return uri.replace(WEBP, '_t.webp$1');
   return uri;
 }

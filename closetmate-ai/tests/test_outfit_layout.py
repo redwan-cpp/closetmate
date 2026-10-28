@@ -306,7 +306,7 @@ class TestLookMeta:
 
 ITEM_KEYS = {
     "item_id", "user_id", "category", "subcategory", "primary_color", "material", "pattern",
-    "formality_level", "cultural_style", "image_path", "created_at", "slot",
+    "formality_level", "cultural_style", "image_path", "thumb_url", "created_at", "slot",
 }
 
 

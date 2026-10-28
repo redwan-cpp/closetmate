@@ -14,7 +14,6 @@ from conftest import make_image_bytes
 
 UPLOAD_ENDPOINTS = [
     "/upload/analyze-clothing",
-    "/upload/upload-clothing",
     "/images/remove-bg",
     "/images/remove-background",
     "/images/style",
@@ -253,64 +252,37 @@ class TestAnalyzeClothing:
 
 
 # ---------------------------------------------------------------------------
-# /upload/upload-clothing
+# /upload/upload-clothing — retired
 # ---------------------------------------------------------------------------
 
-class TestUploadClothing:
-    def test_background_removed_copy_is_stored(self, client, alice, png_bytes, monkeypatch):
-        import routers.upload as upload
+class TestUploadClothingIsRetired:
+    """It used to write photos to a PUBLIC bucket. Photos now go to POST /photos or /studio-shot?store=1."""
 
-        seen = []
-        monkeypatch.setattr(upload, "remove_background_and_save", lambda body: seen.append(body) or "uploads/processed/ok.jpg")
+    def test_it_answers_410_gone(self, client, alice, png_bytes):
         resp = post_file(client, "/upload/upload-clothing", alice, png_bytes)
-        assert resp.status_code == 200
-        assert resp.json() == {"image_path": "uploads/processed/ok.jpg", "status": "background_removed"}
-        assert seen == [png_bytes]
+        assert resp.status_code == 410
+        assert "update the app" in resp.json()["detail"].lower()
 
-    def test_falls_back_to_a_clean_copy_when_background_removal_fails(self, client, alice, png_bytes, monkeypatch):
-        import routers.upload as upload
+    def test_it_still_requires_a_token(self, client, png_bytes):
+        resp = client.post("/upload/upload-clothing", files={"file": ("p.png", png_bytes, "image/png")})
+        assert resp.status_code == 401
 
-        def fail(_body):
-            raise ValueError("rembg is not available")
+    def test_it_does_not_read_or_store_the_upload(self, client, alice, tmp_path):
+        from services.photo_store import get_store
 
-        saved = []
-        monkeypatch.setattr(upload, "remove_background_and_save", fail)
-        monkeypatch.setattr(upload, "_save_original", lambda body: saved.append(body) or "uploads/processed/copy.jpg")
-        resp = post_file(client, "/upload/upload-clothing", alice, png_bytes)
-        assert resp.status_code == 200
-        assert resp.json() == {"image_path": "uploads/processed/copy.jpg", "status": "original_saved"}
-        assert saved == [png_bytes]
+        resp = post_file(client, "/upload/upload-clothing", alice, b"not even an image", content_type="text/html")
+        assert resp.status_code == 410                         # not 400/422: the body is never looked at
+        assert not list(get_store().root.rglob("*.jpg")) and not list(get_store().root.rglob("*.webp"))
 
-    def test_undecodable_fallback_is_422(self, client, alice, png_bytes, monkeypatch):
-        import routers.upload as upload
+    def test_the_public_bucket_helper_is_gone(self):
+        import importlib
 
-        def fail(*_a):
-            raise ValueError("bad image")
+        with pytest.raises(ModuleNotFoundError):
+            importlib.import_module("services.gcs_storage")
 
-        monkeypatch.setattr(upload, "remove_background_and_save", fail)
-        monkeypatch.setattr(upload, "_save_original", fail)
-        resp = post_file(client, "/upload/upload-clothing", alice, png_bytes)
-        assert resp.status_code == 422 and resp.json()["detail"] == "Cannot decode image"
-
-    def test_client_filename_and_content_type_never_reach_storage(self, client, alice, png_bytes, monkeypatch):
-        import routers.upload as upload
-        import services.gcs_storage as gcs
-
-        stored = {}
-
-        def fake_upload(data, filename, content_type="image/jpeg"):
-            stored.update(data=data, filename=filename, content_type=content_type)
-            return "https://storage.googleapis.com/b/" + filename
-
-        monkeypatch.setattr(upload, "remove_background_and_save", lambda _b: (_ for _ in ()).throw(ValueError("x")))
-        monkeypatch.setattr(gcs, "upload_bytes", fake_upload)
-        resp = post_file(client, "/upload/upload-clothing", alice, png_bytes,
-                         content_type="image/svg+xml", filename="../../evil.php")
-        assert resp.status_code == 200
-        assert stored["content_type"] == "image/jpeg"
-        assert stored["filename"].endswith(".jpg") and "evil" not in stored["filename"] and ".." not in stored["filename"]
-        assert stored["data"][:3] == b"\xff\xd8\xff"                      # re-encoded JPEG, not the client's bytes
-        assert stored["data"] != png_bytes
+    def test_it_is_hidden_from_the_api_docs(self, client):
+        # Docs are open in the test environment; the route should not be advertised.
+        assert "/upload/upload-clothing" not in client.get("/openapi.json").json()["paths"]
 
 
 # ---------------------------------------------------------------------------

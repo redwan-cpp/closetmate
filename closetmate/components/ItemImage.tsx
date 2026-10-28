@@ -15,21 +15,31 @@ interface Props {
   style?: StyleProp<ImageStyle>;
   /** Prefer the thumbnail (default). Pass false for big previews. */
   thumb?: boolean;
+  /** The server's thumbnail for this photo, when it has one (stored photos). Else the file-name rule is tried. */
+  thumbSrc?: string | null;
   contentFit?: 'contain' | 'cover';
 }
 
 /** Images known to have no thumbnail, so a remounted cell doesn't 404 on it all over again. */
 const missingThumb = new Set<string>();
 
-export const ItemImage = memo(function ItemImage({ uri, style, thumb = true, contentFit = 'contain' }: Props) {
+/**
+ * A stored photo's link changes every few hours (a new signature), but its picture never does:
+ * caching under the link without its query string keeps it on the phone instead of re-downloading.
+ */
+function sourceFor(uri: string) {
+  return /^https?:\/\//.test(uri) && uri.includes('?') ? { uri, cacheKey: uri.split('?')[0] } : { uri };
+}
+
+export const ItemImage = memo(function ItemImage({ uri, style, thumb = true, thumbSrc, contentFit = 'contain' }: Props) {
   const [, rerender] = useState(0);
 
   if (!uri) return null;
-  const source = thumb && !missingThumb.has(uri) ? (thumbUri(uri) ?? uri) : uri;
+  const source = thumb && !missingThumb.has(uri) ? (thumbSrc ?? thumbUri(uri) ?? uri) : uri;
 
   return (
     <Image
-      source={{ uri: source }}
+      source={sourceFor(source)}
       style={style}
       contentFit={contentFit}
       transition={160}

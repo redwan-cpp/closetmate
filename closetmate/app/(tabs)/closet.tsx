@@ -17,10 +17,12 @@ import * as Haptics from 'expo-haptics';
 import { useColorScheme } from '@/hooks/use-color-scheme';
 import { Brand, Elevation, tintFor } from '@/constants/theme';
 import {
-  Look, WardrobeItem, deleteLook, deleteWardrobeItem, getLooks, logWornOutfit, replaceItemImage, studioShot,
+  Look, WardrobeItem, deleteLook, deleteWardrobeItem, discardPhoto, getLooks, logWornOutfit, replaceItemImage,
+  studioShot,
 } from '@/src/api/ai';
 import { isCutout, prepareForUpload } from '@/src/api/images';
-import { deleteFiles, saveStudioShot, thumbPathOf } from '@/src/api/studioFiles';
+import { deleteFiles, isOwnLocalPhoto, localCopy } from '@/src/api/studioFiles';
+import { BackupProgress, backUpLocalPhotos, localPhotoItems } from '@/src/state/photoBackup';
 import { getClosetItems, invalidateCloset, peekCloset, removeFromCloset } from '@/src/state/closetCache';
 import { useAuth } from '@/src/context/AuthContext';
 import ActionSheetModal from '@/components/ActionSheetModal';
@@ -46,6 +48,7 @@ const toPieces = (look: Look): LookPiece[] =>
   look.items.map((i) => ({
     id: i.item_id,
     uri: i.image_path,
+    thumb: i.thumb_url,
     slot: i.slot,
     label: [i.primary_color, i.subcategory].filter(Boolean).join(' '),
   }));
@@ -296,6 +299,11 @@ export default function ClosetScreen() {
   // The piece whose old photo is being turned into a studio shot (one at a time).
   const [upgradingId, setUpgradingId] = useState<string | null>(null);
   const upgrading = useRef(false);
+  // Moving photos that only exist on this phone into the cloud.
+  const [backup, setBackup] = useState<BackupProgress | null>(null);
+  const backingUp = useRef(false);
+  const itemsRef = useRef(items);
+  itemsRef.current = items;
 
   const ink = dark ? '#FFFFFF' : Brand.ink;
   const muted = dark ? 'rgba(255,255,255,0.6)' : 'rgba(22,20,26,0.55)';
@@ -424,41 +432,64 @@ export default function ClosetScreen() {
     ]);
   }, [loadLooks]);
 
-  // Old photos (a white-background JPEG on this device) can be upgraded to a studio shot. It costs
-  // one background-removal unit, so it's an explicit choice per piece, never automatic.
+  // An opaque photo (an old white-background one, or an original kept because no studio shot could
+  // be made) can be upgraded to a studio shot. It costs one background-removal unit, so it's an
+  // explicit choice per piece, never automatic.
   const upgradePhoto = useCallback(async (item: WardrobeItem) => {
     const oldPath = item.image_path;
     if (!oldPath || upgrading.current) return;
     upgrading.current = true;
     setUpgradingId(item.item_id);
+    let temporary: string | null = null;
     try {
-      const shot = await studioShot(await prepareForUpload(oldPath));
-      if (!shot.cutoutOk) {
+      const local = await localCopy(oldPath);           // a stored photo is fetched first: an upload needs a file
+      if (local.temporary) temporary = local.uri;
+      const shot = await studioShot(await prepareForUpload(local.uri), { store: true });
+      if (!shot.cutoutOk || !shot.imagePath) {
+        if (shot.photoId) discardPhoto(shot.photoId);   // not worth keeping
         Alert.alert('No clean studio shot', 'We couldn’t make out this piece clearly in the photo, so it stays as it is.');
         return;
       }
-      const newPath = await saveStudioShot(shot);
       try {
-        await replaceItemImage(item.item_id, newPath);
+        await replaceItemImage(item.item_id, shot.imagePath);   // the server also removes the replaced stored photo
       } catch (e) {
-        deleteFiles([newPath, thumbPathOf(newPath)]);      // nothing points at them
+        if (shot.photoId) discardPhoto(shot.photoId);
         throw e;
       }
-      if (oldPath.includes('/closetmate_images/')) deleteFiles([oldPath]);   // our own copy, now unused
+      if (isOwnLocalPhoto(oldPath)) deleteFiles([oldPath]);       // an older version's copy on this phone
       invalidateCloset();
-      itemsTicket.current += 1;                            // a load that started earlier has the old path
-      setItems((prev) => prev.map((i) => (i.item_id === item.item_id ? { ...i, image_path: newPath } : i)));
-      loadLooks();                                         // saved looks show the new photo too
+      itemsTicket.current += 1;                          // a load that started earlier has the old photo
+      setItems((prev) => prev.map((i) => (i.item_id === item.item_id
+        ? { ...i, image_path: shot.imageUrl ?? shot.imagePath ?? null, thumb_url: shot.thumbUrl ?? null }
+        : i)));
+      loadLooks();                                       // saved looks show the new photo too
       Haptics.notificationAsync(Haptics.NotificationFeedbackType.Success).catch(() => {});
     } catch (e) {
       Alert.alert('Could not make a studio shot', e instanceof Error ? e.message : 'Please try again.');
     } finally {
+      if (temporary) deleteFiles([temporary]);
       upgrading.current = false;
       setUpgradingId(null);
     }
   }, [loadLooks]);
 
-  const canUpgrade = !!activeItem?.image_path?.startsWith('file://') && !isCutout(activeItem.image_path);
+  const photosOnlyOnThisPhone = localPhotoItems(items).length;
+  const startBackup = useCallback(async () => {
+    if (backingUp.current) return;
+    backingUp.current = true;
+    try {
+      await backUpLocalPhotos(itemsRef.current, setBackup);
+      invalidateCloset();
+      itemsTicket.current += 1;
+      await loadItems(true);                             // the closet now shows the stored copies
+      loadLooks();
+    } finally {
+      backingUp.current = false;
+      setBackup((b) => (b ? { ...b } : b));              // re-render with the final state
+    }
+  }, [loadItems, loadLooks]);
+
+  const canUpgrade = !!activeItem?.image_path && !isCutout(activeItem.image_path);
   const actions = [
     ...(canUpgrade && activeItem
       ? [{ label: 'Make studio shot', onPress: () => { upgradePhoto(activeItem); } }]
@@ -472,8 +503,6 @@ export default function ClosetScreen() {
 
   // One stable callback for the whole grid (ItemCard hands back the id), so memoised cards
   // don't all re-render whenever this screen does.
-  const itemsRef = useRef(items);
-  itemsRef.current = items;
   const openItemSheet = useCallback((id: string) => {
     const item = itemsRef.current.find((i) => i.item_id === id);
     if (!item) return;
@@ -486,6 +515,7 @@ export default function ClosetScreen() {
     <ItemCard
       id={item.item_id}
       uri={item.image_path}
+      thumb={item.thumb_url}
       title={item.subcategory ?? item.category}
       color={item.primary_color}
       width={itemWidth}
@@ -541,6 +571,34 @@ export default function ClosetScreen() {
           />
         ) : (
           <>
+            {photosOnlyOnThisPhone > 0 && (
+              <Pressable
+                onPress={startBackup}
+                disabled={backingUp.current}
+                accessibilityRole="button"
+                accessibilityLabel="Back up photos that are only on this phone"
+                style={({ pressed }) => [
+                  styles.banner,
+                  { backgroundColor: dark ? Brand.accentSoftDark : Brand.accentSoft, transform: [{ scale: pressed ? 0.98 : 1 }] },
+                ]}
+              >
+                <Ionicons name="cloud-upload-outline" size={22} color={Brand.accent} />
+                <View style={styles.bannerText}>
+                  <Text style={[styles.bannerTitle, { color: ink }]}>
+                    {backingUp.current && backup
+                      ? `Backing up ${Math.min(backup.done + backup.failed + backup.missing + 1, backup.total)} of ${backup.total}…`
+                      : `${photosOnlyOnThisPhone} ${photosOnlyOnThisPhone === 1 ? 'photo is' : 'photos are'} only on this phone`}
+                  </Text>
+                  <Text style={[styles.bannerSub, { color: muted }]}>
+                    {backingUp.current
+                      ? 'Keep the app open until it finishes.'
+                      : backup && backup.failed + backup.missing > 0
+                        ? `${backup.failed} couldn’t be saved${backup.missing ? `, ${backup.missing} are gone from this phone` : ''}. Tap to retry.`
+                        : 'Tap to back them up, so they survive a new phone or a reinstall.'}
+                  </Text>
+                </View>
+              </Pressable>
+            )}
             <View>
               <ScrollView
                 horizontal
@@ -620,6 +678,13 @@ const styles = StyleSheet.create({
   safe: { flex: 1 },
   pane: { flex: 1 },
   hidden: { display: 'none' },
+  banner: {
+    flexDirection: 'row', alignItems: 'center', gap: 12, marginHorizontal: SIDE, marginBottom: 12,
+    paddingHorizontal: 14, paddingVertical: 12, borderRadius: 18,
+  },
+  bannerText: { flex: 1 },
+  bannerTitle: { fontSize: 14, fontWeight: '700' },
+  bannerSub: { fontSize: 12, marginTop: 1, lineHeight: 16 },
   busy: {
     ...StyleSheet.absoluteFillObject, backgroundColor: 'rgba(0,0,0,0.5)', alignItems: 'center',
     justifyContent: 'center', gap: 14, zIndex: 50,

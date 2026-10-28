@@ -256,7 +256,7 @@ class TestProductionBoot:
         "ENV": "prod",
         "JWT_SECRET": "p" * 48,
         "DATABASE_URL": "postgresql://user:pw@127.0.0.1:1/db",      # never connected to: init_db is stubbed
-        "OPENAI_API_KEY": "", "GEMINI_API_KEY": "", "GCS_BUCKET": "",
+        "OPENAI_API_KEY": "", "GEMINI_API_KEY": "", "GCS_BUCKET": "test-bucket",   # prod refuses to boot without one
     }
 
     def test_refuses_to_boot_without_a_real_jwt_secret(self):

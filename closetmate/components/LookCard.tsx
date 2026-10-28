@@ -52,6 +52,7 @@ export const LookCard = memo(function LookCard({ items, meta, userId, dark, worn
     () => items.map((item, i) => ({
       id: item.item_id ?? `${item.slot ?? item.subcategory}-${i}`,
       uri: resolveImageUrl(item.image_url),
+      thumb: resolveImageUrl(item.thumb_url),
       slot: item.slot,
       label: `${item.color} ${item.subcategory}`.trim(),
     })),
@@ -111,6 +112,7 @@ export const LookCard = memo(function LookCard({ items, meta, userId, dark, worn
       color: picked.primary_color ?? item.color,
       item_id: picked.item_id,
       image_url: picked.image_path,
+      thumb_url: picked.thumb_url,
       category: picked.category,
       slot: picked.slot ?? item.slot,
     } : item)));

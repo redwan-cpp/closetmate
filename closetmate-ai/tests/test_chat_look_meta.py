@@ -18,7 +18,7 @@ WEATHER = WeatherData(
     condition="Rain", condition_icon="rain", uv_index=6.0, is_day=True,
 )
 
-ITEM_KEYS = {"subcategory", "color", "item_id", "image_url", "category", "slot"}
+ITEM_KEYS = {"subcategory", "color", "item_id", "image_url", "thumb_url", "category", "slot"}
 
 
 def chat(client, account, message="what should I wear?", **extra):

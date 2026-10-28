@@ -1,33 +1,38 @@
 /**
- * src/api/studioFiles.ts — keep studio shots on the device.
+ * src/api/studioFiles.ts — housekeeping for photo files that live on the phone.
  *
- * A studio shot is saved as `item_<stamp>.webp` (640×800, transparent) with a smaller
- * `item_<stamp>_t.webp` (320×400) beside it for grids. The database stores only the full path;
- * the thumbnail is found by naming convention (see thumbUri in images.ts) and is optional.
+ * New photos are kept in the cloud (see uploadPhoto / studioShot({ store: true })). Files in the
+ * app's own folder are only what OLDER versions left behind (closetmate_images/…), plus the
+ * temporary copies made while uploading.
  */
 import * as FileSystem from 'expo-file-system/legacy';
-import type { StudioShotResult } from '@/src/api/ai';
 
-const stripDataUri = (dataUri: string) => dataUri.replace(/^data:image\/[\w+]+;base64,/, '');
-
-/** `…/item_1.webp` → `…/item_1_t.webp`. */
-export function thumbPathOf(fullPath: string): string {
-  return fullPath.replace(/\.webp$/, '_t.webp');
-}
-
-/** Write a studio shot (and its thumbnail) into the app's document directory; returns the full image path. */
-export async function saveStudioShot(shot: StudioShotResult): Promise<string> {
-  const dir = `${FileSystem.documentDirectory ?? ''}closetmate_images/`;
-  await FileSystem.makeDirectoryAsync(dir, { intermediates: true });
-  const full = `${dir}item_${Date.now()}.webp`;
-  await FileSystem.writeAsStringAsync(full, stripDataUri(shot.image), { encoding: FileSystem.EncodingType.Base64 });
-  await FileSystem.writeAsStringAsync(thumbPathOf(full), stripDataUri(shot.thumb), {
-    encoding: FileSystem.EncodingType.Base64,
-  }).catch(() => {});   // the thumbnail is optional
-  return full;
+/** True for a photo file that belongs to this app's own storage (older versions kept photos there). */
+export function isOwnLocalPhoto(uri: string | null | undefined): boolean {
+  return !!uri && uri.startsWith('file://') && uri.includes('/closetmate_images/');
 }
 
 /** Best-effort removal of files we wrote (missing files are fine). */
 export function deleteFiles(paths: string[]): void {
   paths.forEach((p) => { FileSystem.deleteAsync(p, { idempotent: true }).catch(() => {}); });
+}
+
+/** `…/item_1.webp` → `…/item_1_t.webp`: the thumbnail older versions wrote beside a studio shot. */
+export function thumbPathOf(fullPath: string): string {
+  return fullPath.replace(/\.webp$/, '_t.webp');
+}
+
+/**
+ * A local file the uploader can read. Links to stored photos are fetched into the cache first,
+ * because a multipart upload needs a file on the phone. Returns the path and whether it is temporary.
+ */
+export async function localCopy(uri: string): Promise<{ uri: string; temporary: boolean }> {
+  if (!/^https?:\/\//.test(uri)) return { uri, temporary: false };
+  const dest = `${FileSystem.cacheDirectory}download_${Date.now()}.jpg`;
+  const result = await FileSystem.downloadAsync(uri, dest);
+  if (result.status !== 200) {
+    deleteFiles([dest]);
+    throw new Error('Could not load this photo. Check your connection and try again.');
+  }
+  return { uri: dest, temporary: true };
 }
